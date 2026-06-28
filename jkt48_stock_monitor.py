@@ -1062,7 +1062,7 @@ else:
                 current_time_wib.strftime("%H:%M:%S")
     )
         # Tabs
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "👥 Per Team", "📋 Data Table", "📜 Change Log"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "👥 Per Team", "📋 Data Table", "📜 Change Log", "⚡ Speed Tracker"])
         
         with tab1:
             col1, col2 = st.columns(2)
@@ -1530,6 +1530,179 @@ else:
                         )
             else:
                 st.info("No changes detected yet. Background worker is monitoring 24/7!")
+
+        with tab5:
+            # ── Speed Tracker ────────────────────────────────────────────
+            st.subheader("⚡ Sold-Out Speed Tracker")
+            st.caption("Analisis kecepatan penjualan per member dari change log historis")
+
+            # Load semua change log
+            raw_log = load_change_log_from_file() + st.session_state.get('change_log', [])
+            txns = [e for e in raw_log if e.get('type') == 'new_transaction']
+
+            if not txns:
+                st.info("Belum ada data transaksi di change log. Tracker akan aktif begitu ada pembelian terdeteksi.")
+            else:
+                from collections import defaultdict
+
+                # ── Build per-member stats dari change log ────────────────
+                groups = defaultdict(list)
+                for t in txns:
+                    key = (t.get('event', ''), t.get('member', ''), t.get('session', ''))
+                    groups[key].append(t)
+
+                # Sort tiap group by timestamp
+                for key in groups:
+                    groups[key].sort(key=lambda x: x.get('timestamp', ''))
+
+                stats = []
+                for (event, member, session), entries in groups.items():
+                    if not member or not entries:
+                        continue
+
+                    try:
+                        first_ts = datetime.fromisoformat(entries[0]['timestamp']).astimezone(WIB)
+                        last_ts  = datetime.fromisoformat(entries[-1]['timestamp']).astimezone(WIB)
+                    except Exception:
+                        continue
+
+                    total_bought  = sum(e.get('tickets_bought', 0) for e in entries)
+                    duration_secs = (last_ts - first_ts).total_seconds()
+                    duration_hrs  = duration_secs / 3600
+
+                    # Time-to-first-sale: cari entri pertama dengan old_sold == 0
+                    first_sale_entry = next(
+                        (e for e in entries if e.get('old_sold', -1) == 0), None
+                    )
+
+                    # Speed: total tiket / durasi (hindari div/0 kalau hanya 1 transaksi)
+                    speed_per_hour = round(total_bought / duration_hrs, 2) if duration_hrs > 0.01 else None
+
+                    team = MEMBER_TEAM_MAP.get(member, 'Unknown')
+
+                    stats.append({
+                        'event':            event,
+                        'member':           member,
+                        'team':             team,
+                        'session':          session,
+                        'first_txn':        first_ts,
+                        'last_txn':         last_ts,
+                        'total_tickets':    total_bought,
+                        'n_transactions':   len(entries),
+                        'duration_hrs':     round(duration_hrs, 1),
+                        'speed_per_hour':   speed_per_hour,
+                        'has_first_sale':   first_sale_entry is not None,
+                        'first_sale_ts':    first_ts if first_sale_entry else None,
+                        'first_sale_qty':   first_sale_entry.get('tickets_bought', 0) if first_sale_entry else 0,
+                    })
+
+                if not stats:
+                    st.info("Belum cukup data untuk analisis speed.")
+                else:
+                    df_speed = pd.DataFrame(stats)
+
+                    # ── Filter event ──────────────────────────────────────
+                    events_available = sorted(df_speed['event'].unique())
+                    selected_events  = st.multiselect(
+                        "Filter Event", events_available, default=events_available,
+                        key="speed_event_filter"
+                    )
+                    df_speed = df_speed[df_speed['event'].isin(selected_events)]
+
+                    st.divider()
+
+                    # ── Metric summary row ────────────────────────────────
+                    fastest = df_speed[df_speed['speed_per_hour'].notna()].nlargest(1, 'speed_per_hour')
+                    most_txns = df_speed.nlargest(1, 'total_tickets')
+                    first_buyers = df_speed[df_speed['has_first_sale']]
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Member Dianalisis", len(df_speed))
+                    c2.metric("Total Tiket Terjual", f"{df_speed['total_tickets'].sum():,}")
+                    if not fastest.empty:
+                        c3.metric(
+                            "Tercepat",
+                            fastest.iloc[0]['member'].split()[0],
+                            f"{fastest.iloc[0]['speed_per_hour']:.1f} tiket/jam"
+                        )
+                    if not most_txns.empty:
+                        c4.metric(
+                            "Terbanyak",
+                            most_txns.iloc[0]['member'].split()[0],
+                            f"{most_txns.iloc[0]['total_tickets']:,} tiket"
+                        )
+
+                    st.divider()
+
+                    # ── Chart 1: Speed per hour per member ───────────────
+                    df_chart = (
+                        df_speed[df_speed['speed_per_hour'].notna()]
+                        .sort_values('speed_per_hour', ascending=True)
+                    )
+
+                    if not df_chart.empty:
+                        color_map = {
+                            'LOVE': '#ff1744', 'PASSION': '#2979ff',
+                            'DREAM': '#00c853', 'TRAINEE': '#9c27b0', 'Unknown': '#888'
+                        }
+                        df_chart['color'] = df_chart['team'].map(color_map).fillna('#888')
+                        df_chart['label'] = df_chart['member'] + ' (' + df_chart['session'] + ')'
+
+                        fig_speed = px.bar(
+                            df_chart,
+                            x='speed_per_hour',
+                            y='label',
+                            orientation='h',
+                            color='team',
+                            color_discrete_map=color_map,
+                            title="🚀 Kecepatan Penjualan (tiket/jam)",
+                            labels={'speed_per_hour': 'Tiket/Jam', 'label': ''},
+                            text='speed_per_hour',
+                        )
+                        fig_speed.update_traces(texttemplate='%{text:.1f}', textposition='outside')
+                        fig_speed.update_layout(
+                            height=max(300, len(df_chart) * 35),
+                            showlegend=True,
+                            legend_title="Team",
+                        )
+                        st.plotly_chart(fig_speed, use_container_width=True)
+
+                    # ── Chart 2: Time-to-first-sale ───────────────────────
+                    st.divider()
+                    st.markdown("#### ⭐ Time-to-First-Sale")
+                    st.caption("Member dengan `old_sold = 0` di transaksi pertama mereka — artinya terdeteksi sejak tiket pertama dibeli.")
+
+                    df_first = df_speed[df_speed['has_first_sale']].copy()
+                    if df_first.empty:
+                        st.info("Belum ada data first-sale terdeteksi. Butuh monitoring sejak sales dibuka.")
+                    else:
+                        for _, row in df_first.sort_values('first_txn').iterrows():
+                            color = {'LOVE': '#ff1744', 'PASSION': '#2979ff',
+                                     'DREAM': '#00c853', 'TRAINEE': '#9c27b0'}.get(row['team'], '#888')
+                            st.markdown(
+                                f"<div style='border-left:4px solid {color}; padding:8px 14px; "
+                                f"margin-bottom:6px; background:{color}11; border-radius:4px;'>"
+                                f"<strong style='color:{color}'>{row['member']}</strong> "
+                                f"<span style='color:#888; font-size:0.85em'>({row['session']} · {row['event'][:20]})</span><br>"
+                                f"First sale: <strong>{row['first_sale_ts'].strftime('%d/%m/%Y %H:%M WIB')}</strong> "
+                                f"— {row['first_sale_qty']} tiket langsung"
+                                f"</div>",
+                                unsafe_allow_html=True
+                            )
+
+                    # ── Tabel detail ──────────────────────────────────────
+                    st.divider()
+                    st.markdown("#### 📋 Detail per Member")
+                    df_table = df_speed[[
+                        'member', 'team', 'session', 'event',
+                        'total_tickets', 'n_transactions', 'duration_hrs', 'speed_per_hour'
+                    ]].copy()
+                    df_table.columns = [
+                        'Member', 'Team', 'Sesi', 'Event',
+                        'Total Tiket', 'Transaksi', 'Durasi (jam)', 'Tiket/Jam'
+                    ]
+                    df_table = df_table.sort_values('Tiket/Jam', ascending=False, na_position='last')
+                    st.dataframe(df_table, use_container_width=True, hide_index=True)
     
     else:
         st.error("❌ Failed to fetch data from API")
