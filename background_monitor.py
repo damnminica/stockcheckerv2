@@ -2,9 +2,11 @@
 JKT48 Background Stock Monitor
 Runs 24/7 on Railway server - monitors stock changes and logs to file
 Optimized: WIB timezone only, Telegram only, +1 day event date offset
+Transport: aiohttp persistent session (bypass Cloudflare waiting room)
 """
 
-import requests
+import asyncio
+import aiohttp
 import json
 import time
 from datetime import datetime, timezone, timedelta
@@ -12,7 +14,11 @@ import os
 from pathlib import Path
 import pytz
 import locale
-from exclusive_discovery import discover_new_exclusives, get_all_monitored_endpoints
+import requests  # hanya untuk Telegram (fire-and-forget, tidak kena CF)
+from exclusive_discovery import (
+    discover_new_exclusives_async,
+    get_all_monitored_endpoints,
+)
 
 # Constants
 WIB = pytz.timezone('Asia/Jakarta')
@@ -322,66 +328,93 @@ def build_and_save_summary_cache(all_event_data, known_raw):
     except Exception as e:
         print(f"  ❌ Error saving summary cache: {e}")
 
-def fetch_api_data(api_url, cookies=None):
-    """Fetch data from JKT48 API with retry logic and cookie support"""
-    max_retries = 3
-    retry_delay = 5  # seconds
-    
-    # Headers to appear as legitimate API client
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Referer': 'https://jkt48.com/exclusive'
+def _make_session_headers() -> dict:
+    """Headers identik dengan bot Discord — ini yang lolos Cloudflare."""
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "application/json, */*",
+        "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+        "Referer":         "https://jkt48.com/",
+        "Origin":          "https://jkt48.com",
     }
-    
-    for attempt in range(max_retries):
+
+
+async def create_session() -> aiohttp.ClientSession:
+    """
+    Buat satu aiohttp.ClientSession yang hidup sepanjang proses.
+    Cookie jar-nya persistent — Cloudflare challenge cookie otomatis
+    disimpan dan dibawa ke setiap request berikutnya, persis seperti bot Discord.
+    """
+    connector = aiohttp.TCPConnector(
+        limit=10,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+    timeout = aiohttp.ClientTimeout(total=20, connect=10)
+    session = aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers=_make_session_headers(),
+        cookie_jar=aiohttp.CookieJar(),   # persistent across requests
+    )
+    print("  🌐 aiohttp session created (persistent cookie jar)")
+    return session
+
+
+async def fetch_api_data_async(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    extra_cookies: dict = None,
+    max_retries: int = 3,
+) -> dict | None:
+    """
+    Fetch satu endpoint JKT48 API pakai session persistent.
+    Cookie Cloudflare otomatis dihandle oleh cookie jar session.
+    extra_cookies: dari config (manual CF cookie, fallback kalau session belum punya cookie).
+    """
+    for attempt in range(1, max_retries + 1):
         try:
-            response = requests.get(api_url, headers=headers, cookies=cookies, timeout=15)
-            response.raise_for_status()
-            
-            # Check if response is JSON (not HTML waiting room)
-            content_type = response.headers.get('Content-Type', '')
-            if 'text/html' in content_type:
-                print(f"  ⚠️  Received HTML instead of JSON - possible waiting room")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay * 2)  # Wait longer
+            # Inject manual cookie hanya kalau ada (fallback)
+            kwargs = {}
+            if extra_cookies:
+                kwargs['cookies'] = extra_cookies
+
+            async with session.get(api_url, allow_redirects=True, **kwargs) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+
+                if resp.status == 200 and "text/html" not in content_type:
+                    data = await resp.json(content_type=None)
+                    if data.get("status") and data.get("data"):
+                        return data["data"]
+                    print(f"     ⚠️  Status OK tapi struktur data tidak valid")
+                    return None
+
+                elif "text/html" in content_type or resp.status in (403, 429, 503):
+                    print(f"     ⚠️  Kemungkinan Cloudflare waiting room "
+                          f"(status={resp.status}, attempt {attempt}/{max_retries})")
+                    await asyncio.sleep(5 * attempt)
                     continue
-                return None
-            
-            data = response.json()
-            
-            if data.get('status') and data.get('data'):
-                return data['data']
-            
-            print(f"  ⚠️  Invalid data structure from API")
-            return None
-            
-        except requests.exceptions.Timeout:
-            print(f"  ⏱️  Timeout on attempt {attempt + 1}/{max_retries}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                continue
-            return None
-            
-        except requests.exceptions.JSONDecodeError:
-            print(f"  ⚠️  JSON decode error - API might be blocked by waiting room")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay * 3)  # Wait even longer
-                continue
-            return None
-            
-        except requests.exceptions.RequestException as e:
-            print(f"  ❌ Request error on attempt {attempt + 1}/{max_retries}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                continue
-            return None
-            
+
+                else:
+                    print(f"     ⚠️  HTTP {resp.status} untuk {api_url}")
+                    await asyncio.sleep(3 * attempt)
+                    continue
+
+        except asyncio.TimeoutError:
+            print(f"     ⏱️  Timeout attempt {attempt}/{max_retries}")
+            await asyncio.sleep(5 * attempt)
+        except aiohttp.ClientError as e:
+            print(f"     ❌ Client error attempt {attempt}/{max_retries}: {e}")
+            await asyncio.sleep(5 * attempt)
         except Exception as e:
-            print(f"  ❌ Unexpected error fetching {api_url}: {e}")
+            print(f"     ❌ Unexpected error: {e}")
             return None
-    
+
+    print(f"     ❌ Semua {max_retries} attempt gagal untuk {api_url}")
     return None
 
 def detect_changes(new_data, prev_data, event_name, config):
@@ -519,188 +552,175 @@ def detect_changes(new_data, prev_data, event_name, config):
     
     return changes
 
-def monitor_loop():
-    """Main monitoring loop with crash protection"""
+async def monitor_loop():
+    """Main monitoring loop — async dengan aiohttp session persistent."""
     print("=" * 60)
     print("🚀 JKT48 Background Monitor Started")
     print(f"🔄 Refresh interval: {REFRESH_INTERVAL}s")
     print(f"🔍 Discovery interval: every {DISCOVERY_INTERVAL} iterations")
     print(f"📁 Change log: {CHANGE_LOG_FILE}")
     print(f"💾 Config file: {CONFIG_FILE}")
+    print(f"🌐 Transport: aiohttp persistent session (CF-resistant)")
     print("=" * 60)
-    
+
+    # Satu session untuk seluruh lifetime proses
+    session = await create_session()
+
     iteration = 0
     consecutive_errors = 0
     max_consecutive_errors = 10
-    
-    while True:
-        try:
-            iteration += 1
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f"\n[{timestamp}] ⚡ Iteration #{iteration}")
-            
-            # Safety check - if too many consecutive errors, increase sleep time
-            if consecutive_errors >= max_consecutive_errors:
-                error_sleep = REFRESH_INTERVAL * 5  # 2.5 minutes
-                print(f"  ⚠️  {consecutive_errors} consecutive errors - sleeping {error_sleep}s")
-                time.sleep(error_sleep)
-                consecutive_errors = 0  # Reset counter
-                continue
-            
-            # Load config and previous data
-            config = load_config()
-            previous_data = load_previous_data()
-            change_log = load_change_log()
-            
-            # Load Cloudflare waiting room cookie
-            cf_cookies = load_cf_cookie()
-            if cf_cookies:
-                print(f"  🍪 Using Cloudflare cookie")
 
-            # ── Auto-discover exclusive baru setiap DISCOVERY_INTERVAL iterasi ──
-            if iteration % DISCOVERY_INTERVAL == 1:
-                try:
-                    new_exclusives = discover_new_exclusives(cookies=cf_cookies)
-                    if new_exclusives:
-                        print(f"  🆕 {len(new_exclusives)} exclusive baru ditemukan & ditambahkan ke monitoring!")
-                    else:
-                        print(f"  🔍 Discovery: tidak ada exclusive baru")
-                except Exception as e:
-                    print(f"  ⚠️  Discovery error (non-fatal): {e}")
-
-            # Load known_exclusives untuk metadata kategori
-            known_raw = {}
+    try:
+        while True:
             try:
-                known_path = "/mnt/user-data/outputs/known_exclusives.json"
-                if os.path.exists(known_path):
-                    with open(known_path, 'r') as f:
-                        raw = json.load(f)
-                    for v in raw.values():
-                        if v.get("event_name"):
-                            known_raw[v["event_name"]] = v
-            except Exception as e:
-                print(f"  ⚠️  Could not load known_exclusives: {e}")
+                iteration += 1
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"\n[{timestamp}] ⚡ Iteration #{iteration}")
 
-            print(f"  📋 Current log has {len(change_log)} entries")
-
-            all_changes = []
-            all_fetched_data = {}   # ← kumpulkan untuk summary cache
-            # Semua event dari discovery (tidak ada static hardcoded)
-            all_endpoints = get_all_monitored_endpoints({})
-            monitored_events = list(all_endpoints.keys())
-
-            print(f"  🎯 Monitoring {len(monitored_events)} events (semua dari discovery):")
-            for ev in monitored_events:
-                print(f"     - {ev}")
-
-            # Monitor each event - track status per event
-            event_status = {}
-
-            for event_name in monitored_events:
-                if event_name not in all_endpoints:
-                    print(f"  ⚠️  Skipping unknown event: {event_name}")
-                    event_status[event_name] = "SKIPPED (not in endpoints)"
+                # Safety check
+                if consecutive_errors >= max_consecutive_errors:
+                    error_sleep = REFRESH_INTERVAL * 5
+                    print(f"  ⚠️  {consecutive_errors} consecutive errors — sleeping {error_sleep}s")
+                    await asyncio.sleep(error_sleep)
+                    consecutive_errors = 0
                     continue
 
-                api_url = all_endpoints[event_name]
-                print(f"\n  📡 [{event_name}]")
-                print(f"     URL: {api_url}")
+                # Load config dan previous data
+                config       = load_config()
+                previous_data = load_previous_data()
+                change_log   = load_change_log()
 
-                # Fetch new data with cookie
-                new_data = fetch_api_data(api_url, cookies=cf_cookies)
+                # Manual CF cookie (fallback kalau session belum punya cookie)
+                cf_cookies = load_cf_cookie()
+                if cf_cookies:
+                    print(f"  🍪 Manual CF cookie loaded (fallback)")
 
-                if not new_data:
-                    print(f"     ❌ FETCH FAILED")
-                    event_status[event_name] = "FETCH FAILED"
-                    consecutive_errors += 1
-                    continue
+                # ── Auto-discover exclusive baru ──────────────────────────
+                if iteration % DISCOVERY_INTERVAL == 1:
+                    try:
+                        new_exclusives = await discover_new_exclusives_async(session)
+                        if new_exclusives:
+                            print(f"  🆕 {len(new_exclusives)} exclusive baru ditemukan!")
+                        else:
+                            print(f"  🔍 Discovery: tidak ada exclusive baru")
+                    except Exception as e:
+                        print(f"  ⚠️  Discovery error (non-fatal): {e}")
 
-                # Log session count
-                session_count = len(new_data.get('session', []))
-                print(f"     ✅ Fetched {session_count} sessions")
-                consecutive_errors = 0  # Reset on success
-
-                # Simpan untuk summary cache
-                all_fetched_data[event_name] = new_data
-
-                # Get previous data for this event
-                prev_data = previous_data.get(event_name)
-
-                if prev_data is None:
-                    print(f"     ℹ️  First time fetching - establishing baseline")
-                    event_status[event_name] = f"BASELINE ({session_count} sessions)"
-
-                # Detect changes
+                # Load known_exclusives untuk metadata kategori
+                known_raw = {}
                 try:
-                    changes = detect_changes(new_data, prev_data, event_name, config)
-
-                    if changes:
-                        print(f"     🔔 {len(changes)} CHANGE(S) DETECTED!")
-                        for change in changes:
-                            print(f"        - {change['type']}: {change['member']} ({change.get('session', '?')})")
-                        all_changes.extend(changes)
-                        event_status[event_name] = f"{len(changes)} CHANGES"
-                    else:
-                        if prev_data is not None:
-                            print(f"     ✓ No changes")
-                            event_status[event_name] = "NO CHANGES"
+                    known_path = "/mnt/user-data/outputs/known_exclusives.json"
+                    if os.path.exists(known_path):
+                        with open(known_path, 'r') as f:
+                            raw = json.load(f)
+                        for v in raw.values():
+                            if v.get("event_name"):
+                                known_raw[v["event_name"]] = v
                 except Exception as e:
-                    print(f"     ❌ Error detecting changes: {e}")
-                    event_status[event_name] = f"ERROR: {e}"
-                    import traceback
-                    traceback.print_exc()
+                    print(f"  ⚠️  Could not load known_exclusives: {e}")
 
-                # Update previous data
-                previous_data[event_name] = new_data
+                print(f"  📋 Current log has {len(change_log)} entries")
 
-            # Print summary
-            print(f"\n  📊 ITERATION SUMMARY:")
-            for ev, status in event_status.items():
-                print(f"     {ev}: {status}")
+                all_changes      = []
+                all_fetched_data = {}
+                all_endpoints    = get_all_monitored_endpoints({})
+                monitored_events = list(all_endpoints.keys())
 
-            # Build summary cache dari semua data yang berhasil di-fetch
-            if all_fetched_data:
+                print(f"  🎯 Monitoring {len(monitored_events)} events:")
+                for ev in monitored_events:
+                    print(f"     - {ev}")
+
+                event_status = {}
+
+                for event_name in monitored_events:
+                    api_url = all_endpoints.get(event_name)
+                    if not api_url:
+                        event_status[event_name] = "SKIPPED"
+                        continue
+
+                    print(f"\n  📡 [{event_name}]")
+
+                    # Fetch pakai aiohttp session persistent
+                    new_data = await fetch_api_data_async(
+                        session, api_url, extra_cookies=cf_cookies
+                    )
+
+                    if not new_data:
+                        print(f"     ❌ FETCH FAILED")
+                        event_status[event_name] = "FETCH FAILED"
+                        consecutive_errors += 1
+                        continue
+
+                    session_count = len(new_data.get('session', []))
+                    print(f"     ✅ Fetched {session_count} sessions")
+                    consecutive_errors = 0
+
+                    all_fetched_data[event_name] = new_data
+
+                    prev_data = previous_data.get(event_name)
+                    if prev_data is None:
+                        print(f"     ℹ️  First time — establishing baseline")
+                        event_status[event_name] = f"BASELINE ({session_count} sessions)"
+
+                    try:
+                        changes = detect_changes(new_data, prev_data, event_name, config)
+                        if changes:
+                            print(f"     🔔 {len(changes)} CHANGE(S) DETECTED!")
+                            for c in changes:
+                                print(f"        - {c['type']}: {c['member']} ({c.get('session','?')})")
+                            all_changes.extend(changes)
+                            event_status[event_name] = f"{len(changes)} CHANGES"
+                        else:
+                            if prev_data is not None:
+                                print(f"     ✓ No changes")
+                                event_status[event_name] = "NO CHANGES"
+                    except Exception as e:
+                        print(f"     ❌ Error detecting changes: {e}")
+                        event_status[event_name] = f"ERROR: {e}"
+                        import traceback; traceback.print_exc()
+
+                    previous_data[event_name] = new_data
+
+                # Summary
+                print(f"\n  📊 ITERATION SUMMARY:")
+                for ev, status in event_status.items():
+                    print(f"     {ev}: {status}")
+
+                # Build summary cache
+                if all_fetched_data:
+                    try:
+                        build_and_save_summary_cache(all_fetched_data, known_raw)
+                    except Exception as e:
+                        print(f"  ❌ Error building summary cache: {e}")
+
+                # Save
                 try:
-                    build_and_save_summary_cache(all_fetched_data, known_raw)
+                    if all_changes:
+                        change_log.extend(all_changes)
+                        save_change_log(change_log)
+                        print(f"\n  💾 Saved {len(all_changes)} change(s) | Total: {len(change_log)}")
+                    save_previous_data(previous_data)
                 except Exception as e:
-                    print(f"  ❌ Error building summary cache: {e}")
+                    print(f"  ❌ Error saving data: {e}")
+                    import traceback; traceback.print_exc()
 
-            # Save updates
-            try:
-                if all_changes:
-                    change_log.extend(all_changes)
-                    save_change_log(change_log)
-                    print(f"\n  💾 Saved {len(all_changes)} change(s) to log")
-                    print(f"  📊 Total log entries: {len(change_log)}")
+                print(f"  ✅ Iteration #{iteration} complete")
+                print(f"  😴 Sleeping {REFRESH_INTERVAL}s...")
+                await asyncio.sleep(REFRESH_INTERVAL)
 
-                save_previous_data(previous_data)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                print(f"  ❌ Error saving data: {e}")
-                import traceback
-                traceback.print_exc()
+                consecutive_errors += 1
+                print(f"  ❌ Critical error iteration #{iteration}: {e}")
+                import traceback; traceback.print_exc()
+                print(f"  🔄 Continuing... (consecutive errors: {consecutive_errors})")
+                await asyncio.sleep(REFRESH_INTERVAL)
 
-            print(f"  ✅ Iteration #{iteration} complete")
-            print(f"  😴 Sleeping for {REFRESH_INTERVAL}s...")
-            
-        except KeyboardInterrupt:
-            print("\n⚠️  Received interrupt signal - shutting down gracefully...")
-            break
-            
-        except Exception as e:
-            consecutive_errors += 1
-            print(f"  ❌ Critical error in iteration #{iteration}: {e}")
-            import traceback
-            traceback.print_exc()
-            print(f"  🔄 Continuing despite error (consecutive errors: {consecutive_errors})...")
-        
-        # Sleep before next iteration
-        time.sleep(REFRESH_INTERVAL)
-    
-    print("\n👋 Background monitor stopped.")
+    finally:
+        await session.close()
+        print("\n👋 Background monitor stopped. Session closed.")
 
 if __name__ == "__main__":
-    # Create data directory if not exists
     Path("/mnt/user-data/outputs").mkdir(parents=True, exist_ok=True)
-    
-    # Start monitoring
-    monitor_loop()
+    asyncio.run(monitor_loop())
