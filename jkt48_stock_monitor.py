@@ -525,18 +525,9 @@ def render_summary_page():
 
     rows = cache['rows']
     df_all = pd.DataFrame(rows)
-
-    # Groupby member × kategori untuk metrics summary (hindari double-count)
-    df_grouped = (
-        df_all.groupby(['member', 'team', 'category_raw', 'category_label'], as_index=False)
-        .agg(
-            tickets_sold=('tickets_sold', 'sum'),
-            available=('available', 'sum'),
-            total=('total', 'sum'),
-            all_sold_out=('all_sold_out', 'all'),
-        )
-    )
-    df_grouped['sold_pct'] = (df_grouped['tickets_sold'] / df_grouped['total'] * 100).round(1)
+    # Cache dari background_monitor sudah di-grouped per member × kategori
+    # Tidak perlu groupby lagi — langsung pakai df_all
+    df_grouped = df_all.copy()
 
     # ── Tabs per kategori ─────────────────────────────────────────────────
     # Urutkan kategori yang tersedia sesuai CATEGORY_ORDER
@@ -544,17 +535,16 @@ def render_summary_page():
     cats_ordered = [c for c in CATEGORY_ORDER if c in cats_available]
     cats_ordered += [c for c in cats_available if c not in cats_ordered]  # kategori lain di belakang
 
-    cat_labels = [CATEGORY_DISPLAY.get(c, c) for c in cats_ordered]
     cat_icons  = {"TWO_SHOT": "📸", "PHOTOCARD": "🃏", "DIGITAL_PHOTOBOOK": "📖",
                   "VIDEO_CALL": "📹", "MEET_AND_GREET": "🤝", "HANDSHAKE": "🤝"}
     tab_labels = [f"{cat_icons.get(c, '💎')} {CATEGORY_DISPLAY.get(c, c)}" for c in cats_ordered]
 
     # ── Top-level metrics (cross-kategori) ───────────────────────────────
-    total_sold  = df_grouped['tickets_sold'].sum()
-    total_avail = df_grouped['available'].sum()
-    total_so    = df_grouped[df_grouped['all_sold_out']]['member'].nunique()
-    n_events    = df_all['event_name'].nunique()
-    n_members   = df_grouped['member'].nunique()
+    total_sold  = df_all['tickets_sold'].sum()
+    total_avail = df_all['available'].sum()
+    total_so    = df_all[df_all['all_sold_out']]['member'].nunique()
+    n_events    = cache.get('total_events', 0)
+    n_members   = df_all['member'].nunique()
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total Terjual",   f"{total_sold:,}")
@@ -573,13 +563,17 @@ def render_summary_page():
 
     for tab, cat_raw in zip(tabs, cats_ordered):
         with tab:
-            df_cat = df_grouped[df_grouped['category_raw'] == cat_raw].copy()
-            cat_label = CATEGORY_DISPLAY.get(cat_raw, cat_raw)
+            df_cat = df_all[df_all['category_raw'] == cat_raw].copy()
 
-            # Event yang masuk kategori ini (dari df_all asli)
-            events_in_cat = df_all[df_all['category_raw'] == cat_raw]['event_title'].unique().tolist()
-            if len(events_in_cat) > 1:
-                st.caption(f"Event: {' • '.join(events_in_cat)}")
+            # Kumpulkan semua event titles dalam kategori ini (field event_titles adalah list)
+            all_titles = set()
+            for titles in df_cat['event_titles']:
+                if isinstance(titles, list):
+                    all_titles.update(titles)
+                elif isinstance(titles, str):
+                    all_titles.add(titles)
+            if len(all_titles) > 1:
+                st.caption(f"Event: {' • '.join(sorted(all_titles))}")
 
             # ── Metric ringkas per kategori ───────────────────────────────
             m1, m2, m3, m4 = st.columns(4)
