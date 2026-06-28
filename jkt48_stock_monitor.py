@@ -473,6 +473,246 @@ def create_dataframe(data):
     
     return pd.DataFrame(rows)
 
+# Mapping kategori API → label ringkas untuk summary
+CATEGORY_DISPLAY = {
+    "TWO_SHOT":          "2-Shot",
+    "PHOTOCARD":         "Photocard",
+    "DIGITAL_PHOTOBOOK": "Digital Photobook",
+    "VIDEO_CALL":        "Video Call",
+    "MEET_AND_GREET":    "Meet & Greet",
+    "HANDSHAKE":         "Handshake",
+}
+
+# Urutan tampilan di summary (3 kategori utama dulu)
+CATEGORY_ORDER = ["TWO_SHOT", "PHOTOCARD", "DIGITAL_PHOTOBOOK", "VIDEO_CALL", "MEET_AND_GREET", "HANDSHAKE"]
+
+@st.cache_data(ttl=60)
+def fetch_all_summary():
+    """
+    Fetch semua exclusive dari dynamic_endpoints, lalu agregasi per member × kategori.
+    Di-cache 60 detik supaya tidak spam API setiap rerender.
+
+    Returns list of dicts:
+    {
+        event_name, event_title, category_raw, category_label,
+        member, team,
+        tickets_sold, available, total, sold_pct,
+        all_sold_out  ← True kalau semua session member ini sold out
+    }
+    """
+    endpoints = load_dynamic_endpoints()
+    known_raw = {}
+    try:
+        if os.path.exists(KNOWN_EXCLUSIVES_FILE):
+            with open(KNOWN_EXCLUSIVES_FILE, 'r') as f:
+                raw = json.load(f)
+            # index by event_name
+            for v in raw.values():
+                if v.get("event_name"):
+                    known_raw[v["event_name"]] = v
+    except Exception:
+        pass
+
+    rows = []
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Referer': 'https://jkt48.com/exclusive',
+    }
+
+    for event_name, api_url in endpoints.items():
+        # Ambil kategori dari known_exclusives
+        meta = known_raw.get(event_name, {})
+        category_raw = meta.get("category", "")
+        category_label = CATEGORY_DISPLAY.get(category_raw, category_raw.replace("_", " ").title())
+        event_title = meta.get("title", event_name)
+
+        try:
+            resp = requests.get(api_url, headers=headers, timeout=12)
+            resp.raise_for_status()
+            data = resp.json()
+            if not (data.get('status') and data.get('data')):
+                continue
+            event_data = data['data']
+        except Exception:
+            continue
+
+        # Agregasi per member — sum across semua session
+        member_agg = {}
+        for session in event_data.get('session', []):
+            for detail in session.get('session_detail', []):
+                name = detail['jkt48_member_name']
+                sold = detail['tickets_sold']
+                avail = detail['available_quota']
+                total = sold + avail
+                is_so = avail == 0
+
+                if name not in member_agg:
+                    member_agg[name] = {'sold': 0, 'avail': 0, 'total': 0, 'sessions': 0, 'sold_out_sessions': 0}
+                member_agg[name]['sold']   += sold
+                member_agg[name]['avail']  += avail
+                member_agg[name]['total']  += total
+                member_agg[name]['sessions'] += 1
+                if is_so:
+                    member_agg[name]['sold_out_sessions'] += 1
+
+        for member, agg in member_agg.items():
+            team = MEMBER_TEAM_MAP.get(member, 'Unknown')
+            pct = (agg['sold'] / agg['total'] * 100) if agg['total'] > 0 else 0
+            all_so = agg['sessions'] > 0 and agg['sold_out_sessions'] == agg['sessions']
+            rows.append({
+                'event_name':     event_name,
+                'event_title':    event_title,
+                'category_raw':   category_raw,
+                'category_label': category_label,
+                'member':         member,
+                'team':           team,
+                'tickets_sold':   agg['sold'],
+                'available':      agg['avail'],
+                'total':          agg['total'],
+                'sold_pct':       round(pct, 1),
+                'all_sold_out':   all_so,
+            })
+
+    return rows
+
+
+def render_summary_page():
+    """Landing page: summary semua exclusive per kategori × tim × member"""
+    st.title("📊 JKT48 Exclusive — Summary")
+
+    wib_now = now_wib().strftime("%d/%m/%Y %H:%M:%S WIB")
+    col_h1, col_h2 = st.columns([3, 1])
+    with col_h1:
+        st.caption(f"Data realtime dari semua exclusive yang sedang aktif • Last refresh: {wib_now}")
+    with col_h2:
+        if st.button("🔄 Refresh data", key="summary_refresh"):
+            fetch_all_summary.clear()
+            st.rerun()
+
+    with st.spinner("Mengambil data dari semua exclusive..."):
+        rows = fetch_all_summary()
+
+    if not rows:
+        st.warning("Belum ada exclusive yang dimonitor. Tunggu background worker jalan pertama kali (~30 detik setelah deploy).")
+        return
+
+    df_all = pd.DataFrame(rows)
+
+    # ── Tabs per kategori ─────────────────────────────────────────────────
+    # Urutkan kategori yang tersedia sesuai CATEGORY_ORDER
+    cats_available = df_all['category_raw'].unique().tolist()
+    cats_ordered = [c for c in CATEGORY_ORDER if c in cats_available]
+    cats_ordered += [c for c in cats_available if c not in cats_ordered]  # kategori lain di belakang
+
+    cat_labels = [CATEGORY_DISPLAY.get(c, c) for c in cats_ordered]
+    cat_icons  = {"TWO_SHOT": "📸", "PHOTOCARD": "🃏", "DIGITAL_PHOTOBOOK": "📖",
+                  "VIDEO_CALL": "📹", "MEET_AND_GREET": "🤝", "HANDSHAKE": "🤝"}
+    tab_labels = [f"{cat_icons.get(c, '💎')} {CATEGORY_DISPLAY.get(c, c)}" for c in cats_ordered]
+
+    # ── Top-level metrics (cross-kategori) ───────────────────────────────
+    total_sold  = df_all['tickets_sold'].sum()
+    total_avail = df_all['available'].sum()
+    total_so    = df_all[df_all['all_sold_out']]['member'].nunique()
+    n_events    = df_all['event_name'].nunique()
+    n_members   = df_all['member'].nunique()
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Terjual",   f"{total_sold:,}")
+    c2.metric("Tersisa",         f"{total_avail:,}")
+    c3.metric("Member Sold Out", f"{total_so}")
+    c4.metric("Exclusive Aktif", f"{n_events}")
+    c5.metric("Member Terlibat", f"{n_members}")
+
+    st.divider()
+
+    if not tab_labels:
+        st.info("Belum ada kategori yang terdeteksi.")
+        return
+
+    tabs = st.tabs(tab_labels)
+
+    for tab, cat_raw in zip(tabs, cats_ordered):
+        with tab:
+            df_cat = df_all[df_all['category_raw'] == cat_raw].copy()
+            cat_label = CATEGORY_DISPLAY.get(cat_raw, cat_raw)
+
+            # Event yang masuk kategori ini
+            events_in_cat = df_cat['event_title'].unique().tolist()
+            if len(events_in_cat) > 1:
+                st.caption(f"Event: {' • '.join(events_in_cat)}")
+
+            # ── Metric ringkas per kategori ───────────────────────────────
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Terjual",     f"{df_cat['tickets_sold'].sum():,}")
+            m2.metric("Tersisa",     f"{df_cat['available'].sum():,}")
+            sold_pct_cat = (df_cat['tickets_sold'].sum() / df_cat['total'].sum() * 100) if df_cat['total'].sum() > 0 else 0
+            m3.metric("Avg sold",    f"{sold_pct_cat:.1f}%")
+            so_count = df_cat[df_cat['all_sold_out']].shape[0]
+            m4.metric("Sold Out",    f"{so_count} member")
+
+            st.divider()
+
+            # ── Per Tim ───────────────────────────────────────────────────
+            team_order = ['LOVE', 'PASSION', 'DREAM', 'TRAINEE', 'Unknown']
+            teams_present = [t for t in team_order if t in df_cat['team'].unique()]
+
+            for team in teams_present:
+                df_team = df_cat[df_cat['team'] == team].copy()
+                df_team = df_team.sort_values('tickets_sold', ascending=False)
+
+                color = TEAM_COLORS.get(team, '#888888')
+                team_sold  = df_team['tickets_sold'].sum()
+                team_avail = df_team['available'].sum()
+                team_total = df_team['total'].sum()
+                team_pct   = (team_sold / team_total * 100) if team_total > 0 else 0
+                team_so    = df_team[df_team['all_sold_out']].shape[0]
+
+                # Header tim
+                st.markdown(
+                    f"<div style='background:{color}22; border-left:4px solid {color}; "
+                    f"padding:10px 14px; border-radius:6px; margin-bottom:8px;'>"
+                    f"<span style='color:{color}; font-weight:700; font-size:1.05em;'>Team {team}</span>"
+                    f"&nbsp;&nbsp;<span style='color:#888; font-size:0.9em;'>"
+                    f"{len(df_team)} member · {team_sold:,} terjual · {team_avail:,} tersisa · {team_pct:.1f}% · {team_so} sold out"
+                    f"</span></div>",
+                    unsafe_allow_html=True
+                )
+
+                # Grid member — 4 kolom
+                members = df_team.to_dict('records')
+                cols = st.columns(4)
+                for i, row in enumerate(members):
+                    with cols[i % 4]:
+                        sold   = row['tickets_sold']
+                        avail  = row['available']
+                        total  = row['total']
+                        pct    = row['sold_pct']
+                        is_so  = row['all_sold_out']
+
+                        if is_so:
+                            card_bg    = "#ffebee"
+                            badge_html = "<span style='background:#f44336;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;font-weight:700;'>SOLD OUT</span>"
+                        elif pct >= 80:
+                            card_bg    = "#fff8e1"
+                            badge_html = f"<span style='background:#ff9800;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;font-weight:700;'>HOT {pct:.0f}%</span>"
+                        else:
+                            card_bg    = "#f5f5f5"
+                            badge_html = f"<span style='background:#4caf50;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;'>{pct:.0f}%</span>"
+
+                        st.markdown(
+                            f"<div style='background:{card_bg}; border-radius:8px; padding:10px 12px; margin-bottom:8px; min-height:90px;'>"
+                            f"<div style='font-weight:600; font-size:0.88em; margin-bottom:4px; color:#222;'>{row['member']}</div>"
+                            f"{badge_html}"
+                            f"<div style='margin-top:6px; font-size:0.82em; color:#555;'>"
+                            f"🎫 {sold:,} / {total:,}</div>"
+                            f"<div style='font-size:0.78em; color:#888;'>Sisa {avail:,}</div>"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+
+                st.markdown("")  # spacer antar tim
+
 # Sidebar - Settings
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -800,541 +1040,566 @@ with st.sidebar:
 
 # Main content
 st.title("🎵 JKT48 Stock Monitor")
-st.markdown(f"**{st.session_state.selected_event}**")
 
-# Fetch data
-data = fetch_api_data()
-
-if data:
-    # Detect changes
-    changes = detect_changes(data)
-    
-    # Show alerts for recent changes
-    if changes:
-        for change in changes[-3:]:  # Show last 3 changes
-            if change['type'] == 'stock_increase':
-                st.success(
-                    f"📈 **STOCK NAIK!** {change['member']} ({change['session']}): "
-                    f"{change['old_quota']} → {change['new_quota']} (+{change['difference']})"
-                )
-            else:
-                st.error(
-                    f"🔴 **SOLD OUT!** {change['member']} ({change['session']})"
-                )
-    
-    # Create DataFrame
-    df = create_dataframe(data)
-    
-    # Statistics
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        st.metric(
-            "Total Sold",
-            f"{df['Tickets Sold'].sum():,}",
-            f"{df['Sold %'].mean():.1f}%"
-        )
-    
-    with col2:
-        st.metric(
-            "Available",
-            f"{df['Available'].sum():,}"
-        )
-    
-    with col3:
-        sold_out_count = len(df[df['Status'] == 'Sold Out'])
-        st.metric(
-            "Sold Out",
-            sold_out_count
-        )
-    
-    with col4:
-        st.metric(
-            "Changes",
-            len(st.session_state.change_log)
-        )
-    
-    with col5:
-        wib = pytz.timezone('Asia/Jakarta')
-        current_time_wib = datetime.now(pytz.UTC).astimezone(wib)
-        st.metric(
-            "Last Update (WIB)",
-            current_time_wib.strftime("%H:%M:%S")
+# ── Mode selector ─────────────────────────────────────────────────────────
+view_mode = st.radio(
+    "Tampilan",
+    ["📊 Summary Semua Exclusive", "🔍 Detail per Event"],
+    horizontal=True,
+    label_visibility="collapsed"
 )
-    # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "👥 Per Team", "📋 Data Table", "📜 Change Log"])
+
+st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LANDING PAGE — Summary semua exclusive per kategori
+# ═══════════════════════════════════════════════════════════════════════════
+if view_mode == "📊 Summary Semua Exclusive":
+    render_summary_page()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DETAIL PAGE — per event seperti semula
+# ═══════════════════════════════════════════════════════════════════════════
+else:
+    if st.session_state.selected_event is None:
+        st.info("Belum ada exclusive yang dimonitor. Tunggu background worker jalan pertama kali.")
+        st.stop()
+
+    st.markdown(f"**{st.session_state.selected_event}**")
+
+    # Fetch data
+    data = fetch_api_data()
     
-    with tab1:
-        col1, col2 = st.columns(2)
+    if data:
+        # Detect changes
+        changes = detect_changes(data)
+        
+        # Show alerts for recent changes
+        if changes:
+            for change in changes[-3:]:  # Show last 3 changes
+                if change['type'] == 'stock_increase':
+                    st.success(
+                        f"📈 **STOCK NAIK!** {change['member']} ({change['session']}): "
+                        f"{change['old_quota']} → {change['new_quota']} (+{change['difference']})"
+                    )
+                else:
+                    st.error(
+                        f"🔴 **SOLD OUT!** {change['member']} ({change['session']})"
+                    )
+        
+        # Create DataFrame
+        df = create_dataframe(data)
+        
+        # Statistics
+        col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
-            # Top Members
-            top_members = df.groupby('Member')['Tickets Sold'].sum().sort_values(ascending=False).head(10)
-            fig = px.bar(
-                x=top_members.values,
-                y=top_members.index,
-                orientation='h',
-                title="Top 10 Members - Tickets Sold",
-                labels={'x': 'Tickets Sold', 'y': 'Member'},
-                color=top_members.values,
-                color_continuous_scale='viridis'
-            )
-            fig.update_layout(showlegend=False, height=400)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # Status distribution
-            status_counts = df['Status'].value_counts()
-            fig = px.pie(
-                values=status_counts.values,
-                names=status_counts.index,
-                title="Status Distribution",
-                color=status_counts.index,
-                color_discrete_map={
-                    'Available': '#4caf50',
-                    'Low Stock': '#ffd93d',
-                    'Sold Out': '#f44336'
-                }
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with tab2:
-        # Team analysis
-        team_stats = df.groupby('Team').agg({
-            'Tickets Sold': 'sum',
-            'Available': 'sum',
-            'Member': 'nunique'
-        }).reset_index()
-        team_stats.columns = ['Team', 'Total Sold', 'Available', 'Member Count']
-        team_stats['Avg per Member'] = (team_stats['Total Sold'] / team_stats['Member Count']).round(0)
-        
-        # Team sales chart
-        fig = px.bar(
-            team_stats,
-            x='Team',
-            y='Total Sold',
-            title="Sales per Team",
-            color='Team',
-            color_discrete_map=TEAM_COLORS,
-            text='Total Sold'
-        )
-        fig.update_traces(textposition='outside')
-        fig.update_layout(showlegend=False, height=400)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Team cards
-        cols = st.columns(len(team_stats))
-        for idx, (_, team) in enumerate(team_stats.iterrows()):
-            with cols[idx]:
-                st.markdown(f"""
-                <div style="background: {TEAM_COLORS.get(team['Team'], '#667eea')}; 
-                            padding: 1rem; border-radius: 0.5rem; color: white;">
-                    <h3 style="margin: 0;">Team {team['Team']}</h3>
-                    <p style="font-size: 2em; margin: 0.5rem 0; font-weight: bold;">{int(team['Total Sold'])}</p>
-                    <p style="margin: 0; opacity: 0.9;">{int(team['Member Count'])} members</p>
-                    <p style="margin: 0; opacity: 0.9;">Avg: {int(team['Avg per Member'])}/member</p>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        # Members by team
-        st.subheader("Members by Team")
-        for team in team_stats['Team'].unique():
-            with st.expander(f"Team {team} ({len(df[df['Team'] == team]['Member'].unique())} members)"):
-                team_df = df[df['Team'] == team].groupby('Member')['Tickets Sold'].sum().sort_values(ascending=False)
-                st.dataframe(
-                    team_df.reset_index(),
-                    use_container_width=True,
-                    hide_index=True
-                )
-    
-    with tab3:
-        # Filters - 4 columns (removed Session filter)
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            # Date filter - show Indonesian format
-            unique_dates_raw = sorted(df['Date'].unique(), reverse=True)
-            # Create mapping of display dates to raw dates
-            date_display_map = {}
-            for raw_date in unique_dates_raw:
-                # Find first matching row to get display format
-                matching_row = df[df['Date'] == raw_date].iloc[0]
-                display_date = matching_row['Date_Display']
-                date_display_map[display_date] = raw_date
-            
-            date_filter_options = ['All Dates'] + list(date_display_map.keys())
-            selected_date_display = st.selectbox(
-                "Event Date",
-                options=date_filter_options,
-                index=0
+            st.metric(
+                "Total Sold",
+                f"{df['Tickets Sold'].sum():,}",
+                f"{df['Sold %'].mean():.1f}%"
             )
         
         with col2:
-            # Member filter
-            unique_members = sorted(df['Member'].unique())
-            member_filter_options = ['All Members'] + list(unique_members)
-            selected_member_filter = st.selectbox(
-                "Member",
-                options=member_filter_options,
-                index=0
+            st.metric(
+                "Available",
+                f"{df['Available'].sum():,}"
             )
         
         with col3:
-            team_filter = st.multiselect(
-                "Team",
-                options=df['Team'].unique(),
-                default=df['Team'].unique()
+            sold_out_count = len(df[df['Status'] == 'Sold Out'])
+            st.metric(
+                "Sold Out",
+                sold_out_count
             )
         
         with col4:
-            status_filter = st.multiselect(
-                "Status",
-                options=df['Status'].unique(),
-                default=df['Status'].unique()
+            st.metric(
+                "Changes",
+                len(st.session_state.change_log)
             )
         
-        # Filtered data - apply all filters
-        filtered_df = df.copy()
+        with col5:
+            wib = pytz.timezone('Asia/Jakarta')
+            current_time_wib = datetime.now(pytz.UTC).astimezone(wib)
+            st.metric(
+                "Last Update (WIB)",
+                current_time_wib.strftime("%H:%M:%S")
+    )
+        # Tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "👥 Per Team", "📋 Data Table", "📜 Change Log"])
         
-        # Date filter
-        if selected_date_display != 'All Dates':
-            selected_date_raw = date_display_map[selected_date_display]
-            filtered_df = filtered_df[filtered_df['Date'] == selected_date_raw]
-        
-        # Member filter
-        if selected_member_filter != 'All Members':
-            filtered_df = filtered_df[filtered_df['Member'] == selected_member_filter]
-        
-        # Other filters (no Session filter!)
-        filtered_df = filtered_df[
-            (filtered_df['Team'].isin(team_filter)) &
-            (filtered_df['Status'].isin(status_filter))
-        ]
-        
-        # Prepare display dataframe with Indonesian date format
-        display_df = filtered_df.copy()
-        display_df['Date'] = display_df['Date_Display']  # Replace with Indonesian format
-        display_df = display_df.drop(columns=['Date_Display'])  # Remove duplicate column
-        
-        # Display table
-        st.dataframe(
-            display_df.style.map(
-                lambda x: 'background-color: #ffebee' if x == 'Sold Out' else
-                          'background-color: #fff9c4' if x == 'Low Stock' else
-                          'background-color: #e8f5e9' if x == 'Available' else '',
-                subset=['Status']
-            ),
-            use_container_width=True,
-            hide_index=True
-        )
-        
-        st.info(f"Showing {len(filtered_df)} of {len(df)} rows")
-        
-        # Download button
-        csv = filtered_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "📥 Download CSV",
-            csv,
-            f"jkt48_stock_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            "text/csv",
-            key='download-csv'
-        )
-    
-    with tab4:
-        st.subheader("📜 Change Log (24/7 Background Monitor)")
-        
-        # Check if worker is having issues (last update > 5 minutes ago)
-        import time
-        worker_issue = False
-        if os.path.exists("/mnt/user-data/outputs/previous_data.json"):
-            try:
-                mtime = os.path.getmtime("/mnt/user-data/outputs/previous_data.json")
-                seconds_ago = time.time() - mtime
-                if seconds_ago > 300:  # 5 minutes
-                    worker_issue = True
-                    st.warning(f"⚠️ Background worker belum update selama {int(seconds_ago/60)} menit. Kemungkinan API JKT48 sedang down atau ada waiting room aktif. Worker akan retry otomatis.")
-            except:
-                pass
-        
-        if not worker_issue:
-            col_info1, col_info2 = st.columns([3, 1])
-            with col_info1:
-                st.info("💡 Change log diupdate oleh background worker yang jalan 24/7 di server. Semua user melihat log yang sama!")
-            with col_info2:
-                if st.button("🗑️ Clear Old Log", help="Clear old log entries to show only new entries with correct date format"):
-                    try:
-                        # Save empty log
-                        with open("/mnt/user-data/outputs/change_log.json", 'w') as f:
-                            json.dump([], f)
-                        st.success("✅ Old log cleared! New changes will appear with correct format.")
-                        st.rerun()
-                    except:
-                        st.error("❌ Failed to clear log (file permission issue)")
-        
-        st.caption("ℹ️ Old log entries may show '(Event date not available)' - clear log to see new entries with correct Indonesian date format.")
-        
-        # Load change log from file
-        file_change_log = load_change_log_from_file()
-        
-        # Merge with session changes (if any from manual refresh)
-        all_changes = file_change_log + st.session_state.get('change_log', [])
-        
-        # Sort by timestamp (newest first) - handle both string and datetime
-        def get_sort_key(change):
-            ts = change.get('timestamp', '')
-            if isinstance(ts, str):
-                try:
-                    # ISO format from background worker (already has timezone)
-                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                    # Ensure it's timezone-aware
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=pytz.UTC)
-                    return dt
-                except:
-                    return datetime.min.replace(tzinfo=pytz.UTC)
-            elif isinstance(ts, datetime):
-                # datetime object from session - make timezone-aware if not
-                if ts.tzinfo is None:
-                    return ts.replace(tzinfo=pytz.UTC)
-                return ts
-            else:
-                return datetime.min.replace(tzinfo=pytz.UTC)
-        
-        all_changes.sort(key=get_sort_key, reverse=True)
-        
-        # Filter controls
-        col1, col2, col3 = st.columns([2, 2, 1])
-        
-        with col1:
-            change_filter = st.multiselect(
-                "Filter by Type",
-                options=['stock_return', 'refund', 'stock_increase', 'new_transaction', 'sold_out'],
-                default=['stock_return', 'refund', 'stock_increase', 'new_transaction', 'sold_out'],
-                format_func=lambda x: {
-                    'stock_return': '♻️ Stock Kembali',
-                    'refund': '💳 Refund',
-                    'stock_increase': '📈 Stock Naik',
-                    'new_transaction': '🎫 Transaksi',
-                    'sold_out': '🔴 Sold Out'
-                }.get(x, x)
-            )
-        
-        with col2:
-            # Date filter by EVENT DATE (not transaction date) - show Indonesian format
-            if all_changes:
-                # Get unique event dates from changes
-                event_dates_raw = set()
-                for change in all_changes:
-                    session_date = change.get('session_date', '')
-                    if session_date:
-                        event_dates_raw.add(session_date)
-                
-                # Create display mapping
-                date_display_map_log = {}
-                for raw_date in sorted(list(event_dates_raw), reverse=True):
-                    display_date = format_event_date(raw_date)
-                    date_display_map_log[display_date] = raw_date
-                
-                date_options = ['All Dates'] + list(date_display_map_log.keys())
-                selected_date_display_log = st.selectbox("Filter by Event Date", date_options, index=0)
-                
-                # Convert back to raw date for filtering
-                if selected_date_display_log != 'All Dates':
-                    selected_date = date_display_map_log[selected_date_display_log]
-                else:
-                    selected_date = "All Dates"
-            else:
-                selected_date = "All Dates"
-        
-        with col3:
-            max_display = st.selectbox("Show", [10, 25, 50, 100, "All"], index=2)
-        
-        # Filter changes by type
-        filtered_changes = [c for c in all_changes if c.get('type') in change_filter]
-        
-        # Filter by event date
-        if selected_date != "All Dates":
-            filtered_changes = [c for c in filtered_changes if c.get('session_date') == selected_date]
-        
-        # Limit display
-        if max_display != "All":
-            filtered_changes = filtered_changes[:max_display]
-        
-        if filtered_changes:
-            st.markdown(f"**Showing {len(filtered_changes)} of {len(all_changes)} changes**")
+        with tab1:
+            col1, col2 = st.columns(2)
             
-            for change in filtered_changes:
-                # Format timestamp with user's timezone
-                timestamp_str = change.get('timestamp', '')
-                ts = change.get('timestamp', '')
-                
-                # Parse and format transaction timestamp in WIB
-                # Handle multiple formats:
-                # 1. "2026-05-09T07:33:45.013670+00:00" (ISO with timezone)
-                # 2. "2026-05-09T07:33:45.013670+07:00" (ISO with WIB)
-                # 3. "2026-05-09 07:33:45.013670" (UTC without timezone - old format)
-                # 4. "2026-05-09T07:33:45.013670" (ISO without timezone)
-                if isinstance(ts, str) and ts:
-                    try:
-                        # Replace space with T for ISO parsing
-                        ts_clean = ts.replace(' ', 'T').replace('Z', '+00:00')
-                        dt = datetime.fromisoformat(ts_clean)
-                        
-                        # If no timezone info, assume it's UTC (old format)
-                        if dt.tzinfo is None:
-                            dt = pytz.UTC.localize(dt)
-                        
-                        # Convert to WIB
-                        wib_dt = dt.astimezone(WIB)
-                        # Format: "DD/MM/YYYY HH:MM:SS"
-                        timestamp = wib_dt.strftime("%d/%m/%Y %H:%M:%S")
-                    except Exception as e:
-                        # Fallback: try basic parsing
-                        try:
-                            # Format: "2026-05-09 07:33:45.013670"
-                            dt = datetime.strptime(ts.split('.')[0], "%Y-%m-%d %H:%M:%S")
-                            dt = pytz.UTC.localize(dt)  # Assume UTC for old entries
-                            wib_dt = dt.astimezone(WIB)
-                            timestamp = wib_dt.strftime("%d/%m/%Y %H:%M:%S")
-                        except:
-                            timestamp = timestamp_str
-                else:
-                    timestamp = str(ts) if ts else ""
-                
-                # Get event date from session_date and apply +1 day offset
-                event_date_str = change.get('session_date', '')
-                if event_date_str:
-                    # Apply +1 day offset and format to Indonesian
-                    date_display = format_event_date(event_date_str)
-                else:
-                    # Fallback for old entries without session_date
-                    # Try to get from 'date' or other fields
-                    old_date = change.get('date', '') or change.get('event_date', '')
-                    if old_date:
-                        try:
-                            # Parse various formats
-                            if 'T' in old_date:
-                                # ISO format: "2026-05-12T17:00:00.000Z"
-                                dt = datetime.fromisoformat(old_date.replace('Z', '+00:00'))
-                                date_str = dt.strftime('%Y-%m-%d')
-                            else:
-                                date_str = old_date
-                            
-                            # Apply +1 day offset
-                            date_display = format_event_date(date_str)
-                        except:
-                            date_display = old_date
-                    else:
-                        date_display = ""
-                
-                # Fix Unknown Event issue
-                event_name = change.get('event', '')
-                if not event_name or event_name == 'Unknown Event':
-                    # Default to current monitored event
-                    event_name = "We Are Love, Dream, Passion on Fire"
-                session_info = change.get('session', 'N/A')
-                
-                # Stock Return (dari sold out ke available)
-                if change['type'] == 'stock_return':
-                    refund_text = ""
-                    if change.get('refunded_tickets', 0) > 0:
-                        refund_text = f"<br>💳 {change['refunded_tickets']} transaksi dibatalkan"
-                    
-                    st.markdown(f"""
-                    <div style="background: #ff9800; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
-                        ♻️ <strong>Transaksi: {timestamp}</strong><br>
-                        📅 <strong>Event: {date_display}</strong><br>
-                        <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
-                        🎭 Sesi: {session_info}<br>
-                        Sold Out → {change.get('returned_quota', 0)} tiket tersedia{refund_text}
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # Stock Increase (normal)
-                elif change['type'] == 'stock_increase':
-                    st.markdown(f"""
-                    <div class="stock-increase" style="margin-bottom: 0.5rem;">
-                        📈 <strong>Transaksi: {timestamp}</strong><br>
-                        📅 <strong>Event: {date_display}</strong><br>
-                        <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
-                        🎭 Sesi: {session_info}<br>
-                        Stock: {change.get('old_quota', 0)} → {change.get('new_quota', 0)} (+{change.get('difference', 0)})
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # New Transaction
-                elif change['type'] == 'new_transaction':
-                    st.markdown(f"""
-                    <div style="background: #2196f3; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
-                        🎫 <strong>Transaksi: {timestamp}</strong><br>
-                        📅 <strong>Event: {date_display}</strong><br>
-                        <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
-                        🎭 Sesi: {session_info}<br>
-                        {change.get('tickets_bought', 0)} tiket terjual ({change.get('old_sold', 0)} → {change.get('new_sold', 0)})<br>
-                        Sisa stock: {change.get('remaining', 0)}
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # Refund/Cancellation (belum sold out)
-                elif change['type'] == 'refund':
-                    st.markdown(f"""
-                    <div style="background: #9c27b0; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
-                        💳 <strong>Transaksi: {timestamp}</strong><br>
-                        📅 <strong>Event: {date_display}</strong><br>
-                        <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
-                        🎭 Sesi: {session_info}<br>
-                        {change.get('refunded_tickets', 0)} transaksi dibatalkan<br>
-                        Stock kembali: {change.get('new_available', 0)}
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # Sold Out
-                elif change['type'] == 'sold_out':
-                    st.markdown(f"""
-                    <div class="sold-out" style="margin-bottom: 0.5rem;">
-                        🔴 <strong>Transaksi: {timestamp}</strong><br>
-                        📅 <strong>Event: {date_display}</strong><br>
-                        <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
-                        🎭 Sesi: {session_info}<br>
-                        SOLD OUT dari {change.get('last_available', 'N/A')} tiket!
-                    </div>
-                    """, unsafe_allow_html=True)
+            with col1:
+                # Top Members
+                top_members = df.groupby('Member')['Tickets Sold'].sum().sort_values(ascending=False).head(10)
+                fig = px.bar(
+                    x=top_members.values,
+                    y=top_members.index,
+                    orientation='h',
+                    title="Top 10 Members - Tickets Sold",
+                    labels={'x': 'Tickets Sold', 'y': 'Member'},
+                    color=top_members.values,
+                    color_continuous_scale='viridis'
+                )
+                fig.update_layout(showlegend=False, height=400)
+                st.plotly_chart(fig, use_container_width=True)
             
-            # Export and Clear buttons
-            st.divider()
-            col1, col2, col3 = st.columns([2, 1, 1])
             with col2:
-                if st.button("🗑️ Clear Old Logs", help="Remove old log entries with incompatible date format"):
-                    # Keep only entries with session_date field (new format)
-                    new_format_changes = [c for c in all_changes if c.get('session_date')]
-                    
-                    # Save cleaned log
-                    try:
-                        with open("/mnt/user-data/outputs/change_log.json", 'w') as f:
-                            json.dump(new_format_changes, f, indent=2)
-                        st.success(f"✅ Cleared {len(all_changes) - len(new_format_changes)} old entries!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+                # Status distribution
+                status_counts = df['Status'].value_counts()
+                fig = px.pie(
+                    values=status_counts.values,
+                    names=status_counts.index,
+                    title="Status Distribution",
+                    color=status_counts.index,
+                    color_discrete_map={
+                        'Available': '#4caf50',
+                        'Low Stock': '#ffd93d',
+                        'Sold Out': '#f44336'
+                    }
+                )
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with tab2:
+            # Team analysis
+            team_stats = df.groupby('Team').agg({
+                'Tickets Sold': 'sum',
+                'Available': 'sum',
+                'Member': 'nunique'
+            }).reset_index()
+            team_stats.columns = ['Team', 'Total Sold', 'Available', 'Member Count']
+            team_stats['Avg per Member'] = (team_stats['Total Sold'] / team_stats['Member Count']).round(0)
+            
+            # Team sales chart
+            fig = px.bar(
+                team_stats,
+                x='Team',
+                y='Total Sold',
+                title="Sales per Team",
+                color='Team',
+                color_discrete_map=TEAM_COLORS,
+                text='Total Sold'
+            )
+            fig.update_traces(textposition='outside')
+            fig.update_layout(showlegend=False, height=400)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Team cards
+            cols = st.columns(len(team_stats))
+            for idx, (_, team) in enumerate(team_stats.iterrows()):
+                with cols[idx]:
+                    st.markdown(f"""
+                    <div style="background: {TEAM_COLORS.get(team['Team'], '#667eea')}; 
+                                padding: 1rem; border-radius: 0.5rem; color: white;">
+                        <h3 style="margin: 0;">Team {team['Team']}</h3>
+                        <p style="font-size: 2em; margin: 0.5rem 0; font-weight: bold;">{int(team['Total Sold'])}</p>
+                        <p style="margin: 0; opacity: 0.9;">{int(team['Member Count'])} members</p>
+                        <p style="margin: 0; opacity: 0.9;">Avg: {int(team['Avg per Member'])}/member</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            # Members by team
+            st.subheader("Members by Team")
+            for team in team_stats['Team'].unique():
+                with st.expander(f"Team {team} ({len(df[df['Team'] == team]['Member'].unique())} members)"):
+                    team_df = df[df['Team'] == team].groupby('Member')['Tickets Sold'].sum().sort_values(ascending=False)
+                    st.dataframe(
+                        team_df.reset_index(),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+        
+        with tab3:
+            # Filters - 4 columns (removed Session filter)
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                # Date filter - show Indonesian format
+                unique_dates_raw = sorted(df['Date'].unique(), reverse=True)
+                # Create mapping of display dates to raw dates
+                date_display_map = {}
+                for raw_date in unique_dates_raw:
+                    # Find first matching row to get display format
+                    matching_row = df[df['Date'] == raw_date].iloc[0]
+                    display_date = matching_row['Date_Display']
+                    date_display_map[display_date] = raw_date
+                
+                date_filter_options = ['All Dates'] + list(date_display_map.keys())
+                selected_date_display = st.selectbox(
+                    "Event Date",
+                    options=date_filter_options,
+                    index=0
+                )
+            
+            with col2:
+                # Member filter
+                unique_members = sorted(df['Member'].unique())
+                member_filter_options = ['All Members'] + list(unique_members)
+                selected_member_filter = st.selectbox(
+                    "Member",
+                    options=member_filter_options,
+                    index=0
+                )
             
             with col3:
-                if st.button("📥 Export CSV"):
-                    df_changes = pd.DataFrame(filtered_changes)
-                    csv = df_changes.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        "Download CSV",
-                        csv,
-                        f"change_log_{now_wib().strftime('%Y%m%d_%H%M')}.csv",
-                        "text/csv"
-                    )
-        else:
-            st.info("No changes detected yet. Background worker is monitoring 24/7!")
-
-else:
-    st.error("❌ Failed to fetch data from API")
-    st.info("The app will retry automatically if auto-refresh is enabled.")
-
+                team_filter = st.multiselect(
+                    "Team",
+                    options=df['Team'].unique(),
+                    default=df['Team'].unique()
+                )
+            
+            with col4:
+                status_filter = st.multiselect(
+                    "Status",
+                    options=df['Status'].unique(),
+                    default=df['Status'].unique()
+                )
+            
+            # Filtered data - apply all filters
+            filtered_df = df.copy()
+            
+            # Date filter
+            if selected_date_display != 'All Dates':
+                selected_date_raw = date_display_map[selected_date_display]
+                filtered_df = filtered_df[filtered_df['Date'] == selected_date_raw]
+            
+            # Member filter
+            if selected_member_filter != 'All Members':
+                filtered_df = filtered_df[filtered_df['Member'] == selected_member_filter]
+            
+            # Other filters (no Session filter!)
+            filtered_df = filtered_df[
+                (filtered_df['Team'].isin(team_filter)) &
+                (filtered_df['Status'].isin(status_filter))
+            ]
+            
+            # Prepare display dataframe with Indonesian date format
+            display_df = filtered_df.copy()
+            display_df['Date'] = display_df['Date_Display']  # Replace with Indonesian format
+            display_df = display_df.drop(columns=['Date_Display'])  # Remove duplicate column
+            
+            # Display table
+            st.dataframe(
+                display_df.style.map(
+                    lambda x: 'background-color: #ffebee' if x == 'Sold Out' else
+                              'background-color: #fff9c4' if x == 'Low Stock' else
+                              'background-color: #e8f5e9' if x == 'Available' else '',
+                    subset=['Status']
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            st.info(f"Showing {len(filtered_df)} of {len(df)} rows")
+            
+            # Download button
+            csv = filtered_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "📥 Download CSV",
+                csv,
+                f"jkt48_stock_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                key='download-csv'
+            )
+        
+        with tab4:
+            st.subheader("📜 Change Log (24/7 Background Monitor)")
+            
+            # Check if worker is having issues (last update > 5 minutes ago)
+            import time
+            worker_issue = False
+            if os.path.exists("/mnt/user-data/outputs/previous_data.json"):
+                try:
+                    mtime = os.path.getmtime("/mnt/user-data/outputs/previous_data.json")
+                    seconds_ago = time.time() - mtime
+                    if seconds_ago > 300:  # 5 minutes
+                        worker_issue = True
+                        st.warning(f"⚠️ Background worker belum update selama {int(seconds_ago/60)} menit. Kemungkinan API JKT48 sedang down atau ada waiting room aktif. Worker akan retry otomatis.")
+                except:
+                    pass
+            
+            if not worker_issue:
+                col_info1, col_info2 = st.columns([3, 1])
+                with col_info1:
+                    st.info("💡 Change log diupdate oleh background worker yang jalan 24/7 di server. Semua user melihat log yang sama!")
+                with col_info2:
+                    if st.button("🗑️ Clear Old Log", help="Clear old log entries to show only new entries with correct date format"):
+                        try:
+                            # Save empty log
+                            with open("/mnt/user-data/outputs/change_log.json", 'w') as f:
+                                json.dump([], f)
+                            st.success("✅ Old log cleared! New changes will appear with correct format.")
+                            st.rerun()
+                        except:
+                            st.error("❌ Failed to clear log (file permission issue)")
+            
+            st.caption("ℹ️ Old log entries may show '(Event date not available)' - clear log to see new entries with correct Indonesian date format.")
+            
+            # Load change log from file
+            file_change_log = load_change_log_from_file()
+            
+            # Merge with session changes (if any from manual refresh)
+            all_changes = file_change_log + st.session_state.get('change_log', [])
+            
+            # Sort by timestamp (newest first) - handle both string and datetime
+            def get_sort_key(change):
+                ts = change.get('timestamp', '')
+                if isinstance(ts, str):
+                    try:
+                        # ISO format from background worker (already has timezone)
+                        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                        # Ensure it's timezone-aware
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=pytz.UTC)
+                        return dt
+                    except:
+                        return datetime.min.replace(tzinfo=pytz.UTC)
+                elif isinstance(ts, datetime):
+                    # datetime object from session - make timezone-aware if not
+                    if ts.tzinfo is None:
+                        return ts.replace(tzinfo=pytz.UTC)
+                    return ts
+                else:
+                    return datetime.min.replace(tzinfo=pytz.UTC)
+            
+            all_changes.sort(key=get_sort_key, reverse=True)
+            
+            # Filter controls
+            col1, col2, col3 = st.columns([2, 2, 1])
+            
+            with col1:
+                change_filter = st.multiselect(
+                    "Filter by Type",
+                    options=['stock_return', 'refund', 'stock_increase', 'new_transaction', 'sold_out'],
+                    default=['stock_return', 'refund', 'stock_increase', 'new_transaction', 'sold_out'],
+                    format_func=lambda x: {
+                        'stock_return': '♻️ Stock Kembali',
+                        'refund': '💳 Refund',
+                        'stock_increase': '📈 Stock Naik',
+                        'new_transaction': '🎫 Transaksi',
+                        'sold_out': '🔴 Sold Out'
+                    }.get(x, x)
+                )
+            
+            with col2:
+                # Date filter by EVENT DATE (not transaction date) - show Indonesian format
+                if all_changes:
+                    # Get unique event dates from changes
+                    event_dates_raw = set()
+                    for change in all_changes:
+                        session_date = change.get('session_date', '')
+                        if session_date:
+                            event_dates_raw.add(session_date)
+                    
+                    # Create display mapping
+                    date_display_map_log = {}
+                    for raw_date in sorted(list(event_dates_raw), reverse=True):
+                        display_date = format_event_date(raw_date)
+                        date_display_map_log[display_date] = raw_date
+                    
+                    date_options = ['All Dates'] + list(date_display_map_log.keys())
+                    selected_date_display_log = st.selectbox("Filter by Event Date", date_options, index=0)
+                    
+                    # Convert back to raw date for filtering
+                    if selected_date_display_log != 'All Dates':
+                        selected_date = date_display_map_log[selected_date_display_log]
+                    else:
+                        selected_date = "All Dates"
+                else:
+                    selected_date = "All Dates"
+            
+            with col3:
+                max_display = st.selectbox("Show", [10, 25, 50, 100, "All"], index=2)
+            
+            # Filter changes by type
+            filtered_changes = [c for c in all_changes if c.get('type') in change_filter]
+            
+            # Filter by event date
+            if selected_date != "All Dates":
+                filtered_changes = [c for c in filtered_changes if c.get('session_date') == selected_date]
+            
+            # Limit display
+            if max_display != "All":
+                filtered_changes = filtered_changes[:max_display]
+            
+            if filtered_changes:
+                st.markdown(f"**Showing {len(filtered_changes)} of {len(all_changes)} changes**")
+                
+                for change in filtered_changes:
+                    # Format timestamp with user's timezone
+                    timestamp_str = change.get('timestamp', '')
+                    ts = change.get('timestamp', '')
+                    
+                    # Parse and format transaction timestamp in WIB
+                    # Handle multiple formats:
+                    # 1. "2026-05-09T07:33:45.013670+00:00" (ISO with timezone)
+                    # 2. "2026-05-09T07:33:45.013670+07:00" (ISO with WIB)
+                    # 3. "2026-05-09 07:33:45.013670" (UTC without timezone - old format)
+                    # 4. "2026-05-09T07:33:45.013670" (ISO without timezone)
+                    if isinstance(ts, str) and ts:
+                        try:
+                            # Replace space with T for ISO parsing
+                            ts_clean = ts.replace(' ', 'T').replace('Z', '+00:00')
+                            dt = datetime.fromisoformat(ts_clean)
+                            
+                            # If no timezone info, assume it's UTC (old format)
+                            if dt.tzinfo is None:
+                                dt = pytz.UTC.localize(dt)
+                            
+                            # Convert to WIB
+                            wib_dt = dt.astimezone(WIB)
+                            # Format: "DD/MM/YYYY HH:MM:SS"
+                            timestamp = wib_dt.strftime("%d/%m/%Y %H:%M:%S")
+                        except Exception as e:
+                            # Fallback: try basic parsing
+                            try:
+                                # Format: "2026-05-09 07:33:45.013670"
+                                dt = datetime.strptime(ts.split('.')[0], "%Y-%m-%d %H:%M:%S")
+                                dt = pytz.UTC.localize(dt)  # Assume UTC for old entries
+                                wib_dt = dt.astimezone(WIB)
+                                timestamp = wib_dt.strftime("%d/%m/%Y %H:%M:%S")
+                            except:
+                                timestamp = timestamp_str
+                    else:
+                        timestamp = str(ts) if ts else ""
+                    
+                    # Get event date from session_date and apply +1 day offset
+                    event_date_str = change.get('session_date', '')
+                    if event_date_str:
+                        # Apply +1 day offset and format to Indonesian
+                        date_display = format_event_date(event_date_str)
+                    else:
+                        # Fallback for old entries without session_date
+                        # Try to get from 'date' or other fields
+                        old_date = change.get('date', '') or change.get('event_date', '')
+                        if old_date:
+                            try:
+                                # Parse various formats
+                                if 'T' in old_date:
+                                    # ISO format: "2026-05-12T17:00:00.000Z"
+                                    dt = datetime.fromisoformat(old_date.replace('Z', '+00:00'))
+                                    date_str = dt.strftime('%Y-%m-%d')
+                                else:
+                                    date_str = old_date
+                                
+                                # Apply +1 day offset
+                                date_display = format_event_date(date_str)
+                            except:
+                                date_display = old_date
+                        else:
+                            date_display = ""
+                    
+                    # Fix Unknown Event issue
+                    event_name = change.get('event', '')
+                    if not event_name or event_name == 'Unknown Event':
+                        # Default to current monitored event
+                        event_name = "We Are Love, Dream, Passion on Fire"
+                    session_info = change.get('session', 'N/A')
+                    
+                    # Stock Return (dari sold out ke available)
+                    if change['type'] == 'stock_return':
+                        refund_text = ""
+                        if change.get('refunded_tickets', 0) > 0:
+                            refund_text = f"<br>💳 {change['refunded_tickets']} transaksi dibatalkan"
+                        
+                        st.markdown(f"""
+                        <div style="background: #ff9800; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
+                            ♻️ <strong>Transaksi: {timestamp}</strong><br>
+                            📅 <strong>Event: {date_display}</strong><br>
+                            <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
+                            🎭 Sesi: {session_info}<br>
+                            Sold Out → {change.get('returned_quota', 0)} tiket tersedia{refund_text}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Stock Increase (normal)
+                    elif change['type'] == 'stock_increase':
+                        st.markdown(f"""
+                        <div class="stock-increase" style="margin-bottom: 0.5rem;">
+                            📈 <strong>Transaksi: {timestamp}</strong><br>
+                            📅 <strong>Event: {date_display}</strong><br>
+                            <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
+                            🎭 Sesi: {session_info}<br>
+                            Stock: {change.get('old_quota', 0)} → {change.get('new_quota', 0)} (+{change.get('difference', 0)})
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # New Transaction
+                    elif change['type'] == 'new_transaction':
+                        st.markdown(f"""
+                        <div style="background: #2196f3; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
+                            🎫 <strong>Transaksi: {timestamp}</strong><br>
+                            📅 <strong>Event: {date_display}</strong><br>
+                            <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
+                            🎭 Sesi: {session_info}<br>
+                            {change.get('tickets_bought', 0)} tiket terjual ({change.get('old_sold', 0)} → {change.get('new_sold', 0)})<br>
+                            Sisa stock: {change.get('remaining', 0)}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Refund/Cancellation (belum sold out)
+                    elif change['type'] == 'refund':
+                        st.markdown(f"""
+                        <div style="background: #9c27b0; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
+                            💳 <strong>Transaksi: {timestamp}</strong><br>
+                            📅 <strong>Event: {date_display}</strong><br>
+                            <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
+                            🎭 Sesi: {session_info}<br>
+                            {change.get('refunded_tickets', 0)} transaksi dibatalkan<br>
+                            Stock kembali: {change.get('new_available', 0)}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Sold Out
+                    elif change['type'] == 'sold_out':
+                        st.markdown(f"""
+                        <div class="sold-out" style="margin-bottom: 0.5rem;">
+                            🔴 <strong>Transaksi: {timestamp}</strong><br>
+                            📅 <strong>Event: {date_display}</strong><br>
+                            <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
+                            🎭 Sesi: {session_info}<br>
+                            SOLD OUT dari {change.get('last_available', 'N/A')} tiket!
+                        </div>
+                        """, unsafe_allow_html=True)
+                
+                # Export and Clear buttons
+                st.divider()
+                col1, col2, col3 = st.columns([2, 1, 1])
+                with col2:
+                    if st.button("🗑️ Clear Old Logs", help="Remove old log entries with incompatible date format"):
+                        # Keep only entries with session_date field (new format)
+                        new_format_changes = [c for c in all_changes if c.get('session_date')]
+                        
+                        # Save cleaned log
+                        try:
+                            with open("/mnt/user-data/outputs/change_log.json", 'w') as f:
+                                json.dump(new_format_changes, f, indent=2)
+                            st.success(f"✅ Cleared {len(all_changes) - len(new_format_changes)} old entries!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+                
+                with col3:
+                    if st.button("📥 Export CSV"):
+                        df_changes = pd.DataFrame(filtered_changes)
+                        csv = df_changes.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            "Download CSV",
+                            csv,
+                            f"change_log_{now_wib().strftime('%Y%m%d_%H%M')}.csv",
+                            "text/csv"
+                        )
+            else:
+                st.info("No changes detected yet. Background worker is monitoring 24/7!")
+    
+    else:
+        st.error("❌ Failed to fetch data from API")
+        st.info("The app will retry automatically if auto-refresh is enabled.")
+    
 # Footer
 st.divider()
 st.markdown("""
