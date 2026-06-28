@@ -486,117 +486,44 @@ CATEGORY_DISPLAY = {
 # Urutan tampilan di summary (3 kategori utama dulu)
 CATEGORY_ORDER = ["TWO_SHOT", "PHOTOCARD", "DIGITAL_PHOTOBOOK", "VIDEO_CALL", "MEET_AND_GREET", "HANDSHAKE"]
 
-@st.cache_data(ttl=60)
-def fetch_all_summary():
-    """
-    Fetch semua exclusive dari dynamic_endpoints, lalu agregasi per member × kategori.
-    Di-cache 60 detik supaya tidak spam API setiap rerender.
+SUMMARY_CACHE_FILE = "/mnt/user-data/outputs/summary_cache.json"
 
-    Returns list of dicts:
-    {
-        event_name, event_title, category_raw, category_label,
-        member, team,
-        tickets_sold, available, total, sold_pct,
-        all_sold_out  ← True kalau semua session member ini sold out
-    }
+def load_summary_cache():
     """
-    endpoints = load_dynamic_endpoints()
-    known_raw = {}
+    Baca summary_cache.json yang ditulis background_monitor setiap 30 detik.
+    Dashboard tidak perlu hit API JKT48 sama sekali — semua data dari worker.
+    """
     try:
-        if os.path.exists(KNOWN_EXCLUSIVES_FILE):
-            with open(KNOWN_EXCLUSIVES_FILE, 'r') as f:
-                raw = json.load(f)
-            # index by event_name
-            for v in raw.values():
-                if v.get("event_name"):
-                    known_raw[v["event_name"]] = v
+        if os.path.exists(SUMMARY_CACHE_FILE):
+            with open(SUMMARY_CACHE_FILE, 'r') as f:
+                return json.load(f)
     except Exception:
         pass
-
-    rows = []
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Referer': 'https://jkt48.com/exclusive',
-    }
-
-    for event_name, api_url in endpoints.items():
-        # Ambil kategori dari known_exclusives
-        meta = known_raw.get(event_name, {})
-        category_raw = meta.get("category", "")
-        category_label = CATEGORY_DISPLAY.get(category_raw, category_raw.replace("_", " ").title())
-        event_title = meta.get("title", event_name)
-
-        try:
-            resp = requests.get(api_url, headers=headers, timeout=12)
-            resp.raise_for_status()
-            data = resp.json()
-            if not (data.get('status') and data.get('data')):
-                continue
-            event_data = data['data']
-        except Exception:
-            continue
-
-        # Agregasi per member — sum across semua session
-        member_agg = {}
-        for session in event_data.get('session', []):
-            for detail in session.get('session_detail', []):
-                name = detail['jkt48_member_name']
-                sold = detail['tickets_sold']
-                avail = detail['available_quota']
-                total = sold + avail
-                is_so = avail == 0
-
-                if name not in member_agg:
-                    member_agg[name] = {'sold': 0, 'avail': 0, 'total': 0, 'sessions': 0, 'sold_out_sessions': 0}
-                member_agg[name]['sold']   += sold
-                member_agg[name]['avail']  += avail
-                member_agg[name]['total']  += total
-                member_agg[name]['sessions'] += 1
-                if is_so:
-                    member_agg[name]['sold_out_sessions'] += 1
-
-        for member, agg in member_agg.items():
-            team = MEMBER_TEAM_MAP.get(member, 'Unknown')
-            pct = (agg['sold'] / agg['total'] * 100) if agg['total'] > 0 else 0
-            all_so = agg['sessions'] > 0 and agg['sold_out_sessions'] == agg['sessions']
-            rows.append({
-                'event_name':     event_name,
-                'event_title':    event_title,
-                'category_raw':   category_raw,
-                'category_label': category_label,
-                'member':         member,
-                'team':           team,
-                'tickets_sold':   agg['sold'],
-                'available':      agg['avail'],
-                'total':          agg['total'],
-                'sold_pct':       round(pct, 1),
-                'all_sold_out':   all_so,
-            })
-
-    return rows
+    return None
 
 
 def render_summary_page():
     """Landing page: summary semua exclusive per kategori × tim × member"""
     st.title("📊 JKT48 Exclusive — Summary")
 
-    wib_now = now_wib().strftime("%d/%m/%Y %H:%M:%S WIB")
+    cache = load_summary_cache()
+
     col_h1, col_h2 = st.columns([3, 1])
     with col_h1:
-        st.caption(f"Data realtime dari semua exclusive yang sedang aktif • Last refresh: {wib_now}")
+        if cache:
+            st.caption(f"Data dari background worker • Last update: **{cache.get('updated_at_wib', '–')}** • {cache.get('total_events', 0)} event aktif")
+        else:
+            st.caption("Menunggu data dari background worker...")
     with col_h2:
-        if st.button("🔄 Refresh data", key="summary_refresh"):
-            fetch_all_summary.clear()
+        if st.button("🔄 Refresh", key="summary_refresh"):
             st.rerun()
 
-    with st.spinner("Mengambil data dari semua exclusive..."):
-        rows = fetch_all_summary()
-
-    if not rows:
-        st.warning("Belum ada exclusive yang dimonitor. Tunggu background worker jalan pertama kali (~30 detik setelah deploy).")
+    if not cache or not cache.get('rows'):
+        st.warning("Background worker belum menulis data. Tunggu ~30 detik setelah deploy, lalu refresh.")
+        st.info("Pastikan `background_monitor.py` sudah jalan di Railway.")
         return
 
+    rows = cache['rows']
     df_all = pd.DataFrame(rows)
 
     # Groupby member × kategori untuk metrics summary (hindari double-count)
@@ -1067,6 +994,8 @@ st.divider()
 # LANDING PAGE — Summary semua exclusive per kategori
 # ═══════════════════════════════════════════════════════════════════════════
 if view_mode == "📊 Summary Semua Exclusive":
+    # Auto-refresh setiap 30 detik — sinkron dengan interval background worker
+    st_autorefresh(interval=30_000, key="summary_autorefresh")
     render_summary_page()
 
 # ═══════════════════════════════════════════════════════════════════════════

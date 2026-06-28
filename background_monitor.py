@@ -28,6 +28,45 @@ CHANGE_LOG_FILE = "/mnt/user-data/outputs/change_log.json"
 PREVIOUS_DATA_FILE = "/mnt/user-data/outputs/previous_data.json"
 CONFIG_FILE = "/mnt/user-data/outputs/monitor_config.json"
 COOKIE_FILE = "/mnt/user-data/outputs/cf_cookie.json"
+SUMMARY_CACHE_FILE = "/mnt/user-data/outputs/summary_cache.json"
+
+CATEGORY_DISPLAY = {
+    "TWO_SHOT":          "2-Shot",
+    "PHOTOCARD":         "Photocard",
+    "DIGITAL_PHOTOBOOK": "Digital Photobook",
+    "VIDEO_CALL":        "Video Call",
+    "MEET_AND_GREET":    "Meet & Greet",
+    "HANDSHAKE":         "Handshake",
+}
+
+MEMBER_TEAM_MAP = {
+    # LOVE
+    "Fiony Alveria": "LOVE", "Michelle Alexandra": "LOVE", "Cathleen Nixie": "LOVE",
+    "Alya Amanda": "LOVE", "Aurhel Alana": "LOVE", "Celline Thefani": "LOVE",
+    "Cynthia Yaputera": "LOVE", "Anindya Ramadhani": "LOVE", "Aurellia": "LOVE",
+    "Fritzy Rosmerian": "LOVE", "Grace Octaviani": "LOVE", "Indah Cahya": "LOVE",
+    "Nayla Suji": "LOVE", "Hillary Abigail": "LOVE", "Jazzlyn Trisha": "LOVE",
+    # PASSION
+    "Jessica Chandra": "PASSION", "Mutiara Azzahra": "PASSION", "Desy Natalia": "PASSION",
+    "Angelina Christy": "PASSION", "Michelle Levia": "PASSION", "Kathrina Irene": "PASSION",
+    "Victoria Kimberly": "PASSION", "Abigail Rachel": "PASSION", "Ribka Budiman": "PASSION",
+    "Cornelia Vanisa": "PASSION", "Lulu Salsabila": "PASSION", "Dena Natalia": "PASSION",
+    "Raisha Syifa": "PASSION", "Feni Fitriyanti": "PASSION", "Catherina Vallencia": "PASSION",
+    # DREAM
+    "Marsha Lenathea": "DREAM", "Freya Jayawardana": "DREAM", "Febriola Sinambela": "DREAM",
+    "Gita Sekar Andarini": "DREAM", "Helisma Putri": "DREAM", "Gabriela Abigail": "DREAM",
+    "Jesslyn Elly": "DREAM", "Nina Tutachia": "DREAM", "Shabilqis Naila": "DREAM",
+    "Oline Manuel": "DREAM", "Adeline Wijaya": "DREAM", "Chelsea Davina": "DREAM",
+    "Greesella Adhalia": "DREAM", "Gendis Mayrannisa": "DREAM",
+    # TRAINEE
+    "Jemima Evodie": "TRAINEE", "Nur Intan": "TRAINEE", "Jacqueline Immanuela": "TRAINEE",
+    "Afera Thalia": "TRAINEE", "Astrella Virgiananda": "TRAINEE", "Aulia Riza": "TRAINEE",
+    "Bong Aprilli": "TRAINEE", "Carissa Dini": "TRAINEE", "Christabella Bonita": "TRAINEE",
+    "Fahira Putri": "TRAINEE", "Fatimah Azzahra": "TRAINEE", "Hagia Sopia": "TRAINEE",
+    "Heidi Suyangga": "TRAINEE", "Humaira Ramadhani": "TRAINEE", "Maxine Faye": "TRAINEE",
+    "Mikaela Kusjanto": "TRAINEE", "Putry Jazyta": "TRAINEE", "Ralyne Van Irwan": "TRAINEE",
+    "Sona Kalyana": "TRAINEE",
+}
 
 # Helper functions
 def now_wib():
@@ -172,10 +211,116 @@ def send_telegram_notification(message):
         print(f"Telegram error: {e}")
         return False
 
-        response = requests.get(url, timeout=5)
-        return response.status_code == 200
+
+def build_and_save_summary_cache(all_event_data, known_raw):
+    """
+    Agregasi data semua event → summary per member × kategori, simpan ke JSON.
+    Dipanggil setiap iterasi oleh monitor_loop() setelah semua event di-fetch.
+
+    all_event_data: dict {event_name: raw_api_data}
+    known_raw:      dict {event_name: metadata dari known_exclusives.json}
+    """
+    # Flat list of rows: satu row per member per event
+    rows = []
+    for event_name, event_data in all_event_data.items():
+        if not event_data:
+            continue
+
+        meta = known_raw.get(event_name, {})
+        category_raw   = meta.get("category", "")
+        category_label = CATEGORY_DISPLAY.get(category_raw, category_raw.replace("_", " ").title())
+        event_title    = meta.get("title", event_name)
+
+        # Agregasi per member (sum semua session dalam satu event)
+        member_agg = {}
+        for session in event_data.get('session', []):
+            for detail in session.get('session_detail', []):
+                name  = detail['jkt48_member_name']
+                sold  = detail['tickets_sold']
+                avail = detail['available_quota']
+                total = sold + avail
+                is_so = avail == 0
+
+                if name not in member_agg:
+                    member_agg[name] = {'sold': 0, 'avail': 0, 'total': 0, 'sessions': 0, 'so_sessions': 0}
+                member_agg[name]['sold']       += sold
+                member_agg[name]['avail']      += avail
+                member_agg[name]['total']      += total
+                member_agg[name]['sessions']   += 1
+                member_agg[name]['so_sessions'] += int(is_so)
+
+        for member, agg in member_agg.items():
+            team    = MEMBER_TEAM_MAP.get(member, 'Unknown')
+            pct     = round(agg['sold'] / agg['total'] * 100, 1) if agg['total'] > 0 else 0.0
+            all_so  = agg['sessions'] > 0 and agg['so_sessions'] == agg['sessions']
+            rows.append({
+                'event_name':     event_name,
+                'event_title':    event_title,
+                'category_raw':   category_raw,
+                'category_label': category_label,
+                'member':         member,
+                'team':           team,
+                'tickets_sold':   agg['sold'],
+                'available':      agg['avail'],
+                'total':          agg['total'],
+                'sold_pct':       pct,
+                'all_sold_out':   all_so,
+            })
+
+    # Groupby member × kategori (gabungkan kalau member ada di beberapa event kategori sama)
+    grouped = {}
+    for r in rows:
+        key = (r['member'], r['category_raw'])
+        if key not in grouped:
+            grouped[key] = {
+                'member':         r['member'],
+                'team':           r['team'],
+                'category_raw':   r['category_raw'],
+                'category_label': r['category_label'],
+                'event_titles':   [],
+                'tickets_sold':   0,
+                'available':      0,
+                'total':          0,
+                'all_rows_so':    True,   # akan di-AND
+            }
+        g = grouped[key]
+        if r['event_title'] not in g['event_titles']:
+            g['event_titles'].append(r['event_title'])
+        g['tickets_sold'] += r['tickets_sold']
+        g['available']    += r['available']
+        g['total']        += r['total']
+        g['all_rows_so']   = g['all_rows_so'] and r['all_sold_out']
+
+    # Finalisasi
+    summary_rows = []
+    for g in grouped.values():
+        pct = round(g['tickets_sold'] / g['total'] * 100, 1) if g['total'] > 0 else 0.0
+        summary_rows.append({
+            'member':         g['member'],
+            'team':           g['team'],
+            'category_raw':   g['category_raw'],
+            'category_label': g['category_label'],
+            'event_titles':   g['event_titles'],
+            'tickets_sold':   g['tickets_sold'],
+            'available':      g['available'],
+            'total':          g['total'],
+            'sold_pct':       pct,
+            'all_sold_out':   g['all_rows_so'],
+        })
+
+    cache = {
+        'updated_at':    now_wib().isoformat(),
+        'updated_at_wib': now_wib().strftime('%d/%m/%Y %H:%M:%S WIB'),
+        'total_events':  len(all_event_data),
+        'rows':          summary_rows,
+    }
+
+    try:
+        with open(SUMMARY_CACHE_FILE, 'w') as f:
+            json.dump(cache, f, ensure_ascii=False)
+        print(f"  💾 Summary cache saved: {len(summary_rows)} rows ({len(all_event_data)} events)")
     except Exception as e:
-        return False
+        print(f"  ❌ Error saving summary cache: {e}")
 
 def fetch_api_data(api_url, cookies=None):
     """Fetch data from JKT48 API with retry logic and cookie support"""
@@ -422,10 +567,24 @@ def monitor_loop():
                         print(f"  🔍 Discovery: tidak ada exclusive baru")
                 except Exception as e:
                     print(f"  ⚠️  Discovery error (non-fatal): {e}")
-            
+
+            # Load known_exclusives untuk metadata kategori
+            known_raw = {}
+            try:
+                known_path = "/mnt/user-data/outputs/known_exclusives.json"
+                if os.path.exists(known_path):
+                    with open(known_path, 'r') as f:
+                        raw = json.load(f)
+                    for v in raw.values():
+                        if v.get("event_name"):
+                            known_raw[v["event_name"]] = v
+            except Exception as e:
+                print(f"  ⚠️  Could not load known_exclusives: {e}")
+
             print(f"  📋 Current log has {len(change_log)} entries")
-            
+
             all_changes = []
+            all_fetched_data = {}   # ← kumpulkan untuk summary cache
             # Semua event dari discovery (tidak ada static hardcoded)
             all_endpoints = get_all_monitored_endpoints({})
             monitored_events = list(all_endpoints.keys())
@@ -433,45 +592,48 @@ def monitor_loop():
             print(f"  🎯 Monitoring {len(monitored_events)} events (semua dari discovery):")
             for ev in monitored_events:
                 print(f"     - {ev}")
-            
+
             # Monitor each event - track status per event
             event_status = {}
-            
+
             for event_name in monitored_events:
                 if event_name not in all_endpoints:
                     print(f"  ⚠️  Skipping unknown event: {event_name}")
                     event_status[event_name] = "SKIPPED (not in endpoints)"
                     continue
-                
+
                 api_url = all_endpoints[event_name]
                 print(f"\n  📡 [{event_name}]")
                 print(f"     URL: {api_url}")
-                
+
                 # Fetch new data with cookie
                 new_data = fetch_api_data(api_url, cookies=cf_cookies)
-                
+
                 if not new_data:
                     print(f"     ❌ FETCH FAILED")
                     event_status[event_name] = "FETCH FAILED"
                     consecutive_errors += 1
                     continue
-                
+
                 # Log session count
                 session_count = len(new_data.get('session', []))
                 print(f"     ✅ Fetched {session_count} sessions")
                 consecutive_errors = 0  # Reset on success
-                
+
+                # Simpan untuk summary cache
+                all_fetched_data[event_name] = new_data
+
                 # Get previous data for this event
                 prev_data = previous_data.get(event_name)
-                
+
                 if prev_data is None:
                     print(f"     ℹ️  First time fetching - establishing baseline")
                     event_status[event_name] = f"BASELINE ({session_count} sessions)"
-                
+
                 # Detect changes
                 try:
                     changes = detect_changes(new_data, prev_data, event_name, config)
-                    
+
                     if changes:
                         print(f"     🔔 {len(changes)} CHANGE(S) DETECTED!")
                         for change in changes:
@@ -487,15 +649,22 @@ def monitor_loop():
                     event_status[event_name] = f"ERROR: {e}"
                     import traceback
                     traceback.print_exc()
-                
+
                 # Update previous data
                 previous_data[event_name] = new_data
-            
+
             # Print summary
             print(f"\n  📊 ITERATION SUMMARY:")
             for ev, status in event_status.items():
                 print(f"     {ev}: {status}")
-            
+
+            # Build summary cache dari semua data yang berhasil di-fetch
+            if all_fetched_data:
+                try:
+                    build_and_save_summary_cache(all_fetched_data, known_raw)
+                except Exception as e:
+                    print(f"  ❌ Error building summary cache: {e}")
+
             # Save updates
             try:
                 if all_changes:
@@ -503,13 +672,13 @@ def monitor_loop():
                     save_change_log(change_log)
                     print(f"\n  💾 Saved {len(all_changes)} change(s) to log")
                     print(f"  📊 Total log entries: {len(change_log)}")
-                
+
                 save_previous_data(previous_data)
             except Exception as e:
                 print(f"  ❌ Error saving data: {e}")
                 import traceback
                 traceback.print_exc()
-            
+
             print(f"  ✅ Iteration #{iteration} complete")
             print(f"  😴 Sleeping for {REFRESH_INTERVAL}s...")
             
