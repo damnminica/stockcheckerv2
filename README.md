@@ -278,5 +278,3 @@ MIT License - Free to use and modify!
 Made with ❤️ for JKT48 fans
 
 **Star ⭐ this repo if useful!**
-# stockcheckerv2
-# stockcheckerv2

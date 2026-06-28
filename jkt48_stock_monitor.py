@@ -120,13 +120,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# API Configuration - TAMBAH EVENT DI SINI!
-API_ENDPOINTS = {
-    "MnG Love Dream Passion": "https://jkt48.com/api/v1/exclusives/EXE588?lang=id",
-    "2shot Love Dream Passion": "https://jkt48.com/api/v1/exclusives/EX579E?lang=id",
-    "Love Dream Passion - Music Video Behind The Scenes": "https://jkt48.com/api/v1/exclusives/EXBE10?lang=id",
-    "We Are Love, Dream Team, Passion On Fire!": "https://jkt48.com/api/v1/exclusives/EX3725?lang=id",
-}
+# Semua event dikelola otomatis oleh exclusive_discovery — tidak ada hardcode
 
 # File paths for background worker
 CHANGE_LOG_FILE = "/mnt/user-data/outputs/change_log.json"
@@ -166,7 +160,7 @@ def load_config_from_file():
     
     return {
         "telegram": {"token": "", "chat_id": "", "enabled": False},
-        "monitored_events": list(API_ENDPOINTS.keys())
+        "monitored_events": []
     }
 
 def load_dynamic_endpoints() -> dict:
@@ -181,13 +175,10 @@ def load_dynamic_endpoints() -> dict:
 
 def get_all_event_options() -> dict:
     """
-    Gabungkan API_ENDPOINTS (static hardcoded) + dynamic endpoints dari discovery.
-    Static menang kalau ada konflik nama.
+    Ambil semua event dari dynamic endpoints (hasil discovery).
+    Custom session-based events ditangani terpisah di sidebar.
     """
-    dynamic = load_dynamic_endpoints()
-    merged = dict(dynamic)
-    merged.update(API_ENDPOINTS)  # static override
-    return merged
+    return load_dynamic_endpoints()
 
 def load_discovery_summary() -> dict:
     """Load summary exclusive yang sudah pernah ditemukan oleh background worker"""
@@ -216,7 +207,7 @@ def load_discovery_summary() -> dict:
 # Initialize session state
 if 'selected_event' not in st.session_state:
     _initial_events = list(get_all_event_options().keys())
-    st.session_state.selected_event = _initial_events[0] if _initial_events else list(API_ENDPOINTS.keys())[0]
+    st.session_state.selected_event = _initial_events[0] if _initial_events else None
 if 'previous_data' not in st.session_state:
     st.session_state.previous_data = None
 if 'change_log' not in st.session_state:
@@ -772,12 +763,13 @@ with st.sidebar:
         
         # Load config
         bg_config = load_config_from_file()
-        
-        # Monitored events
+
+        # Monitored events — dari dynamic discovery
+        _all_discovered = list(get_all_event_options().keys())
         monitored_events = st.multiselect(
             "Events to Monitor",
-            options=list(API_ENDPOINTS.keys()),
-            default=bg_config.get("monitored_events", list(API_ENDPOINTS.keys())),
+            options=_all_discovered,
+            default=bg_config.get("monitored_events", _all_discovered),
             key="bg_events"
         )
         

@@ -19,14 +19,8 @@ WIB = pytz.timezone('Asia/Jakarta')
 TELEGRAM_BOT_TOKEN = "8541605155:AAFlFyF1g2DkW-ZonmX2H_7S-k67n3JKjWE"
 TELEGRAM_CHAT_ID = "824000905"
 
-# Configuration
-# IMPORTANT: Must match dashboard's API_ENDPOINTS to ensure all events are monitored
-API_ENDPOINTS = {
-    "MnG Love Dream Passion": "https://jkt48.com/api/v1/exclusives/EXE588?lang=id",
-    "2shot Love Dream Passion": "https://jkt48.com/api/v1/exclusives/EX579E?lang=id",
-    "Love Dream Passion - Music Video Behind The Scenes": "https://jkt48.com/api/v1/exclusives/EXBE10?lang=id",
-    "We Are Love, Dream Team, Passion On Fire!": "https://jkt48.com/api/v1/exclusives/EX3725?lang=id",
-}
+# Semua event dikelola otomatis oleh exclusive_discovery.py
+# Tidak ada hardcode — dynamic_endpoints.json dikelola background worker
 
 REFRESH_INTERVAL = 30  # seconds
 DISCOVERY_INTERVAL = 10  # Check for new exclusives every N iterations (~5 menit)
@@ -75,7 +69,7 @@ def load_config():
     
     return {
         "telegram": {"token": "", "chat_id": "", "enabled": False},
-        "monitored_events": list(API_ENDPOINTS.keys()),
+        "monitored_events": [],
         "cf_cookie_name": "",   # Dynamic cookie name (e.g., __cfwaitingroom_xxx)
         "cf_cookie_value": ""   # Cookie value
     }
@@ -384,7 +378,6 @@ def monitor_loop():
     """Main monitoring loop with crash protection"""
     print("=" * 60)
     print("🚀 JKT48 Background Monitor Started")
-    print(f"📊 Monitoring {len(API_ENDPOINTS)} static events")
     print(f"🔄 Refresh interval: {REFRESH_INTERVAL}s")
     print(f"🔍 Discovery interval: every {DISCOVERY_INTERVAL} iterations")
     print(f"📁 Change log: {CHANGE_LOG_FILE}")
@@ -433,11 +426,11 @@ def monitor_loop():
             print(f"  📋 Current log has {len(change_log)} entries")
             
             all_changes = []
-            # Merge static API_ENDPOINTS + dynamic endpoints hasil discovery
-            all_endpoints = get_all_monitored_endpoints(API_ENDPOINTS)
+            # Semua event dari discovery (tidak ada static hardcoded)
+            all_endpoints = get_all_monitored_endpoints({})
             monitored_events = list(all_endpoints.keys())
-            
-            print(f"  🎯 Monitoring {len(monitored_events)} events ({len(API_ENDPOINTS)} static + {len(all_endpoints) - len(API_ENDPOINTS)} dynamic):")
+
+            print(f"  🎯 Monitoring {len(monitored_events)} events (semua dari discovery):")
             for ev in monitored_events:
                 print(f"     - {ev}")
             
