@@ -609,6 +609,7 @@ def render_summary_page():
             all_sold_out=('all_sold_out', 'all'),
         )
     )
+    df_grouped['sold_pct'] = (df_grouped['tickets_sold'] / df_grouped['total'] * 100).round(1)
 
     # ── Tabs per kategori ─────────────────────────────────────────────────
     # Urutkan kategori yang tersedia sesuai CATEGORY_ORDER
