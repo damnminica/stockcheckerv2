@@ -23,25 +23,19 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Date formatting functions
+# Static Indonesian names — no locale.setlocale() (global + slow, dulu dipanggil per-baris)
+_HARI_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+_BULAN_ID = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+             "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+
+from functools import lru_cache
+
+@lru_cache(maxsize=512)
 def format_event_date(api_date_str):
-    """Convert API date (YYYY-MM-DD) to display format with +1 day offset
-    Returns: 'Jumat, 09 Mei 2026' format
-    """
+    """Convert API date (YYYY-MM-DD) to 'Jumat, 09 Mei 2026' with +1 day offset."""
     try:
-        # Parse API date and add 1 day
         date_obj = datetime.strptime(api_date_str, '%Y-%m-%d') + timedelta(days=1)
-        
-        # Try to set Indonesian locale
-        try:
-            locale.setlocale(locale.LC_TIME, 'id_ID.UTF-8')
-        except:
-            try:
-                locale.setlocale(locale.LC_TIME, 'id_ID')
-            except:
-                pass  # Fallback to English if Indonesian locale not available
-        
-        # Format: "Jumat, 09 Mei 2026"
-        return date_obj.strftime("%A, %d %B %Y")
+        return f"{_HARI_ID[date_obj.weekday()]}, {date_obj.day:02d} {_BULAN_ID[date_obj.month]} {date_obj.year}"
     except:
         return api_date_str
 
@@ -128,14 +122,15 @@ CONFIG_FILE = "/mnt/user-data/outputs/monitor_config.json"
 DYNAMIC_ENDPOINTS_FILE = "/mnt/user-data/outputs/dynamic_endpoints.json"
 KNOWN_EXCLUSIVES_FILE = "/mnt/user-data/outputs/known_exclusives.json"
 
+@st.cache_data(ttl=30)
 def load_change_log_from_file():
-    """Load change log from file (written by background worker)"""
+    """Load change log from file (written by background worker). Cached 30s (sinkron worker)."""
     try:
         if os.path.exists(CHANGE_LOG_FILE):
             with open(CHANGE_LOG_FILE, 'r') as f:
                 return json.load(f)
-    except Exception as e:
-        st.error(f"Error loading change log: {e}")
+    except Exception:
+        pass
     return []
 
 def save_config_to_file(config):
@@ -163,8 +158,9 @@ def load_config_from_file():
         "monitored_events": []
     }
 
+@st.cache_data(ttl=30)
 def load_dynamic_endpoints() -> dict:
-    """Load auto-discovered exclusive endpoints dari background worker"""
+    """Load auto-discovered exclusive endpoints dari background worker. Cached 30s."""
     try:
         if os.path.exists(DYNAMIC_ENDPOINTS_FILE):
             with open(DYNAMIC_ENDPOINTS_FILE, 'r') as f:
@@ -488,10 +484,11 @@ CATEGORY_ORDER = ["TWO_SHOT", "PHOTOCARD", "DIGITAL_PHOTOBOOK", "VIDEO_CALL", "M
 
 SUMMARY_CACHE_FILE = "/mnt/user-data/outputs/summary_cache.json"
 
+@st.cache_data(ttl=30)
 def load_summary_cache():
     """
     Baca summary_cache.json yang ditulis background_monitor setiap 30 detik.
-    Dashboard tidak perlu hit API JKT48 sama sekali — semua data dari worker.
+    Cached 30s — dashboard tidak hit API JKT48, semua data dari worker.
     """
     try:
         if os.path.exists(SUMMARY_CACHE_FILE):
@@ -601,50 +598,46 @@ def render_summary_page():
                 team_pct   = (team_sold / team_total * 100) if team_total > 0 else 0
                 team_so    = df_team[df_team['all_sold_out']].shape[0]
 
-                # Header tim
-                st.markdown(
-                    f"<div style='background:{color}22; border-left:4px solid {color}; "
-                    f"padding:10px 14px; border-radius:6px; margin-bottom:8px;'>"
-                    f"<span style='color:{color}; font-weight:700; font-size:1.05em;'>Team {team}</span>"
-                    f"&nbsp;&nbsp;<span style='color:#888; font-size:0.9em;'>"
+                # Header tim + grid kartu digabung jadi SATU st.markdown per tim.
+                # Sebelumnya: 1 header + st.columns(4) + N st.markdown per member
+                # (ratusan elemen tiap render). Sekarang: 1 elemen/tim, grid CSS responsif.
+                cards = []
+                for row in df_team.to_dict('records'):
+                    sold, avail, total = row['tickets_sold'], row['available'], row['total']
+                    pct, is_so = row['sold_pct'], row['all_sold_out']
+
+                    if is_so:
+                        card_bg = "#ffebee"
+                        badge = "<span style='background:#f44336;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;font-weight:700;'>SOLD OUT</span>"
+                    elif pct >= 80:
+                        card_bg = "#fff8e1"
+                        badge = f"<span style='background:#ff9800;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;font-weight:700;'>HOT {pct:.0f}%</span>"
+                    else:
+                        card_bg = "#f5f5f5"
+                        badge = f"<span style='background:#4caf50;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;'>{pct:.0f}%</span>"
+
+                    cards.append(
+                        f"<div style='background:{card_bg};border-radius:8px;padding:10px 12px;min-height:90px;'>"
+                        f"<div style='font-weight:600;font-size:0.88em;margin-bottom:4px;color:#222;'>{row['member']}</div>"
+                        f"{badge}"
+                        f"<div style='margin-top:6px;font-size:0.82em;color:#555;'>🎫 {sold:,} / {total:,}</div>"
+                        f"<div style='font-size:0.78em;color:#888;'>Sisa {avail:,}</div>"
+                        f"</div>"
+                    )
+
+                header = (
+                    f"<div style='background:{color}22;border-left:4px solid {color};"
+                    f"padding:10px 14px;border-radius:6px;margin-bottom:8px;'>"
+                    f"<span style='color:{color};font-weight:700;font-size:1.05em;'>Team {team}</span>"
+                    f"&nbsp;&nbsp;<span style='color:#888;font-size:0.9em;'>"
                     f"{len(df_team)} member · {team_sold:,} terjual · {team_avail:,} tersisa · {team_pct:.1f}% · {team_so} sold out"
-                    f"</span></div>",
-                    unsafe_allow_html=True
+                    f"</span></div>"
                 )
-
-                # Grid member — 4 kolom
-                members = df_team.to_dict('records')
-                cols = st.columns(4)
-                for i, row in enumerate(members):
-                    with cols[i % 4]:
-                        sold   = row['tickets_sold']
-                        avail  = row['available']
-                        total  = row['total']
-                        pct    = row['sold_pct']
-                        is_so  = row['all_sold_out']
-
-                        if is_so:
-                            card_bg    = "#ffebee"
-                            badge_html = "<span style='background:#f44336;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;font-weight:700;'>SOLD OUT</span>"
-                        elif pct >= 80:
-                            card_bg    = "#fff8e1"
-                            badge_html = f"<span style='background:#ff9800;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;font-weight:700;'>HOT {pct:.0f}%</span>"
-                        else:
-                            card_bg    = "#f5f5f5"
-                            badge_html = f"<span style='background:#4caf50;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;'>{pct:.0f}%</span>"
-
-                        st.markdown(
-                            f"<div style='background:{card_bg}; border-radius:8px; padding:10px 12px; margin-bottom:8px; min-height:90px;'>"
-                            f"<div style='font-weight:600; font-size:0.88em; margin-bottom:4px; color:#222;'>{row['member']}</div>"
-                            f"{badge_html}"
-                            f"<div style='margin-top:6px; font-size:0.82em; color:#555;'>"
-                            f"🎫 {sold:,} / {total:,}</div>"
-                            f"<div style='font-size:0.78em; color:#888;'>Sisa {avail:,}</div>"
-                            f"</div>",
-                            unsafe_allow_html=True
-                        )
-
-                st.markdown("")  # spacer antar tim
+                grid = (
+                    "<div style='display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));"
+                    "gap:8px;margin-bottom:16px;'>" + "".join(cards) + "</div>"
+                )
+                st.markdown(header + grid, unsafe_allow_html=True)
 
 # Sidebar - Settings
 with st.sidebar:
@@ -716,10 +709,8 @@ with st.sidebar:
             "Enable Notifications",
             value=st.session_state.notifications_enabled
         )
-        
-        # Auto refresh
-        st_autorefresh(interval=refresh_interval * 1000, key="data_refresh")
-        
+        # NB: st_autorefresh dipanggil di branch Detail (bukan di sini) supaya
+        # tidak dobel dengan summary_autorefresh saat mode Summary aktif.
         st.info(f"🔄 Refreshing every {refresh_interval}s")
         if st.session_state.notifications_enabled:
             st.success("🔔 Notifications ON")
@@ -751,6 +742,10 @@ if view_mode == "📊 Summary Semua Exclusive":
 # DETAIL PAGE — per event seperti semula
 # ═══════════════════════════════════════════════════════════════════════════
 else:
+    # Auto-refresh khusus mode Detail (satu-satunya timer di mode ini)
+    if auto_refresh:
+        st_autorefresh(interval=refresh_interval * 1000, key="data_refresh")
+
     if st.session_state.selected_event is None:
         st.info("Belum ada exclusive yang dimonitor. Tunggu background worker jalan pertama kali.")
         st.stop()
@@ -1118,7 +1113,9 @@ else:
             
             if filtered_changes:
                 st.markdown(f"**Showing {len(filtered_changes)} of {len(all_changes)} changes**")
-                
+
+                # Kumpulkan semua kartu ke satu string → 1 st.markdown (bukan N).
+                blocks = []
                 for change in filtered_changes:
                     # Format timestamp with user's timezone
                     timestamp_str = change.get('timestamp', '')
@@ -1196,7 +1193,7 @@ else:
                         if change.get('refunded_tickets', 0) > 0:
                             refund_text = f"<br>💳 {change['refunded_tickets']} transaksi dibatalkan"
                         
-                        st.markdown(f"""
+                        blocks.append(f"""
                         <div style="background: #ff9800; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
                             ♻️ <strong>Transaksi: {timestamp}</strong><br>
                             📅 <strong>Event: {date_display}</strong><br>
@@ -1204,11 +1201,11 @@ else:
                             🎭 Sesi: {session_info}<br>
                             Sold Out → {change.get('returned_quota', 0)} tiket tersedia{refund_text}
                         </div>
-                        """, unsafe_allow_html=True)
+                        """)
                     
                     # Stock Increase (normal)
                     elif change['type'] == 'stock_increase':
-                        st.markdown(f"""
+                        blocks.append(f"""
                         <div class="stock-increase" style="margin-bottom: 0.5rem;">
                             📈 <strong>Transaksi: {timestamp}</strong><br>
                             📅 <strong>Event: {date_display}</strong><br>
@@ -1216,11 +1213,11 @@ else:
                             🎭 Sesi: {session_info}<br>
                             Stock: {change.get('old_quota', 0)} → {change.get('new_quota', 0)} (+{change.get('difference', 0)})
                         </div>
-                        """, unsafe_allow_html=True)
+                        """)
                     
                     # New Transaction
                     elif change['type'] == 'new_transaction':
-                        st.markdown(f"""
+                        blocks.append(f"""
                         <div style="background: #2196f3; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
                             🎫 <strong>Transaksi: {timestamp}</strong><br>
                             📅 <strong>Event: {date_display}</strong><br>
@@ -1229,11 +1226,11 @@ else:
                             {change.get('tickets_bought', 0)} tiket terjual ({change.get('old_sold', 0)} → {change.get('new_sold', 0)})<br>
                             Sisa stock: {change.get('remaining', 0)}
                         </div>
-                        """, unsafe_allow_html=True)
+                        """)
                     
                     # Refund/Cancellation (belum sold out)
                     elif change['type'] == 'refund':
-                        st.markdown(f"""
+                        blocks.append(f"""
                         <div style="background: #9c27b0; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
                             💳 <strong>Transaksi: {timestamp}</strong><br>
                             📅 <strong>Event: {date_display}</strong><br>
@@ -1242,11 +1239,11 @@ else:
                             {change.get('refunded_tickets', 0)} transaksi dibatalkan<br>
                             Stock kembali: {change.get('new_available', 0)}
                         </div>
-                        """, unsafe_allow_html=True)
+                        """)
                     
                     # Sold Out
                     elif change['type'] == 'sold_out':
-                        st.markdown(f"""
+                        blocks.append(f"""
                         <div class="sold-out" style="margin-bottom: 0.5rem;">
                             🔴 <strong>Transaksi: {timestamp}</strong><br>
                             📅 <strong>Event: {date_display}</strong><br>
@@ -1254,8 +1251,11 @@ else:
                             🎭 Sesi: {session_info}<br>
                             SOLD OUT dari {change.get('last_available', 'N/A')} tiket!
                         </div>
-                        """, unsafe_allow_html=True)
-                
+                        """)
+
+                # Render semua kartu change log sekaligus (1 elemen, bukan ratusan)
+                st.markdown("".join(blocks), unsafe_allow_html=True)
+
                 # Export and Clear buttons
                 st.divider()
                 col1, col2, col3 = st.columns([2, 1, 1])
