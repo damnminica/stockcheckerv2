@@ -22,8 +22,10 @@ from exclusive_discovery import (
 
 # Constants
 WIB = pytz.timezone('Asia/Jakarta')
-TELEGRAM_BOT_TOKEN = "8541605155:AAFlFyF1g2DkW-ZonmX2H_7S-k67n3JKjWE"
-TELEGRAM_CHAT_ID = "824000905"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print("⚠️ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID belum di-set di environment — notifikasi Telegram dinonaktifkan.")
 
 # Semua event dikelola otomatis oleh exclusive_discovery.py
 # Tidak ada hardcode — dynamic_endpoints.json dikelola background worker
@@ -190,14 +192,10 @@ def load_change_log():
     return []
 
 def save_change_log(changes):
-    """Save change log to file"""
+    """Save change log to file — SEMUA perubahan disimpan, tanpa batas."""
     try:
-        # Keep only last 500 changes to prevent file from growing too large
-        if len(changes) > 500:
-            changes = changes[-500:]
-        
         with open(CHANGE_LOG_FILE, 'w') as f:
-            json.dump(changes, f, indent=2)
+            json.dump(changes, f, indent=2, default=str)
     except Exception as e:
         print(f"Error saving change log: {e}")
 

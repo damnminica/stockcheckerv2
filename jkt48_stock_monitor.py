@@ -19,8 +19,8 @@ import os
 
 # Constants
 WIB = pytz.timezone('Asia/Jakarta')
-TELEGRAM_BOT_TOKEN = "8541605155:AAFlFyF1g2DkW-ZonmX2H_7S-k67n3JKjWE"
-TELEGRAM_CHAT_ID = "824000905"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Date formatting functions
 def format_event_date(api_date_str):

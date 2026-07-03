@@ -25,8 +25,8 @@ EXCLUSIVES_LIST_API  = "https://jkt48.com/api/v1/exclusives?lang=id"
 KNOWN_EXCLUSIVES_FILE  = "/mnt/user-data/outputs/known_exclusives.json"
 DYNAMIC_ENDPOINTS_FILE = "/mnt/user-data/outputs/dynamic_endpoints.json"
 
-TELEGRAM_BOT_TOKEN = "8541605155:AAFlFyF1g2DkW-ZonmX2H_7S-k67n3JKjWE"
-TELEGRAM_CHAT_ID   = "824000905"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 _HEADERS = {
     "User-Agent": (
