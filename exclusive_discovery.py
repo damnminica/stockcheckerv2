@@ -68,26 +68,24 @@ def _send_telegram(message: str) -> bool:
 # ── Fetch list exclusives — async pakai session persistent ────────────────────
 
 async def _fetch_exclusives_list_async(session) -> list:
-    """Fetch pakai aiohttp session yang sama dengan monitor (cookie jar shared)."""
+    """Fetch pakai curl_cffi AsyncSession yang sama dengan monitor (impersonasi Chrome)."""
     for attempt in range(1, 4):
         try:
-            async with session.get(
-                EXCLUSIVES_LIST_API, allow_redirects=True,
-                **proxy_pool.aiohttp_kwargs()
-            ) as resp:
-                content_type = resp.headers.get("Content-Type", "")
-                if resp.status == 200 and "text/html" not in content_type:
-                    data = await resp.json(content_type=None)
-                    if data.get("status") and isinstance(data.get("data"), list):
-                        return data["data"]
-                    print("  [Discovery] Struktur data tidak valid")
-                    return []
-                else:
-                    print(f"  [Discovery] CF/waiting room? status={resp.status} attempt {attempt}/3")
-                    await asyncio.sleep(10 * attempt)
-        except asyncio.TimeoutError:
-            print(f"  [Discovery] Timeout attempt {attempt}/3")
-            await asyncio.sleep(5 * attempt)
+            kw = {}
+            proxies = proxy_pool.requests_proxies()
+            if proxies:
+                kw["proxies"] = proxies
+            resp = await session.get(EXCLUSIVES_LIST_API, **kw)
+            content_type = resp.headers.get("Content-Type", "")
+            if resp.status_code == 200 and "text/html" not in content_type:
+                data = resp.json()
+                if data.get("status") and isinstance(data.get("data"), list):
+                    return data["data"]
+                print("  [Discovery] Struktur data tidak valid")
+                return []
+            else:
+                print(f"  [Discovery] CF challenge? status={resp.status_code} attempt {attempt}/3")
+                await asyncio.sleep(10 * attempt)
         except Exception as e:
             print(f"  [Discovery] Error attempt {attempt}/3: {e}")
             await asyncio.sleep(5)
@@ -95,11 +93,12 @@ async def _fetch_exclusives_list_async(session) -> list:
 
 
 def _fetch_exclusives_list_sync() -> list:
-    """Fallback sync — dipakai hanya kalau dipanggil standalone tanpa session."""
+    """Fallback sync (standalone) — curl_cffi impersonasi Chrome."""
+    from curl_cffi import requests as cffi
     for attempt in range(3):
         try:
-            resp = requests.get(
-                EXCLUSIVES_LIST_API, headers=_HEADERS, timeout=15,
+            resp = cffi.get(
+                EXCLUSIVES_LIST_API, impersonate="chrome", timeout=25,
                 proxies=proxy_pool.requests_proxies()
             )
             content_type = resp.headers.get("Content-Type", "")

@@ -22,6 +22,7 @@ from exclusive_discovery import (
 )
 import proxy_pool
 from jkt48_schema import to_bonus_url, normalize_bonus
+from curl_cffi.requests import AsyncSession
 
 # Constants
 WIB = pytz.timezone('Asia/Jakarta')
@@ -336,83 +337,64 @@ def _make_session_headers() -> dict:
     }
 
 
-async def create_session() -> aiohttp.ClientSession:
+async def create_session():
     """
-    Buat satu aiohttp.ClientSession yang hidup sepanjang proses.
-    Cookie jar-nya persistent — Cloudflare challenge cookie otomatis
-    disimpan dan dibawa ke setiap request berikutnya, persis seperti bot Discord.
+    curl_cffi AsyncSession dengan impersonasi Chrome.
+    Meniru fingerprint TLS/HTTP2 Chrome asli -> lolos Cloudflare, sementara
+    aiohttp/requests polos ketahuan 'bukan browser' dan kena 403 challenge.
     """
-    connector = aiohttp.TCPConnector(
-        limit=10,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
+    session = AsyncSession(
+        impersonate="chrome",
+        timeout=25,
+        headers={"Referer": "https://jkt48.com/", "Origin": "https://jkt48.com"},
     )
-    timeout = aiohttp.ClientTimeout(total=20, connect=10)
-    session = aiohttp.ClientSession(
-        connector=connector,
-        timeout=timeout,
-        headers=_make_session_headers(),
-        cookie_jar=aiohttp.CookieJar(),   # persistent across requests
-    )
-    print("  🌐 aiohttp session created (persistent cookie jar)")
+    print("  🌐 curl_cffi AsyncSession (impersonate=chrome)")
     if proxy_pool.has_proxies():
         print(f"  🔌 Proxy pool aktif: {proxy_pool.count()} proxy (rotasi round-robin)")
     else:
-        print("  🔌 Proxy: tidak ada (koneksi langsung) — set JKT48_PROXY_LIST untuk aktifkan")
+        print("  🔌 Proxy: koneksi langsung (tanpa proxy)")
     return session
 
 
-async def fetch_api_data_async(
-    session: aiohttp.ClientSession,
-    api_url: str,
-    extra_cookies: dict = None,
-    max_retries: int = 3,
-) -> dict | None:
+async def fetch_api_data_async(session, api_url, extra_cookies=None, max_retries=3):
     """
-    Fetch satu endpoint JKT48 API pakai session persistent.
-    Cookie Cloudflare otomatis dihandle oleh cookie jar session.
-    extra_cookies: dari config (manual CF cookie, fallback kalau session belum punya cookie).
+    Fetch satu endpoint JKT48 API pakai curl_cffi (impersonasi Chrome).
+    Rotasi proxy per attempt kalau JKT48_PROXY_LIST di-set (kalau tidak: langsung).
     """
     for attempt in range(1, max_retries + 1):
         try:
-            # Inject manual cookie hanya kalau ada (fallback)
-            kwargs = {}
+            kw = {}
+            proxies = proxy_pool.requests_proxies()  # rotasi; None kalau tak ada proxy
+            if proxies:
+                kw["proxies"] = proxies
             if extra_cookies:
-                kwargs['cookies'] = extra_cookies
-            # Rotasi proxy per attempt: attempt gagal -> retry pakai IP lain
-            kwargs.update(proxy_pool.aiohttp_kwargs())
+                kw["cookies"] = extra_cookies
 
-            async with session.get(api_url, allow_redirects=True, **kwargs) as resp:
-                content_type = resp.headers.get("Content-Type", "")
+            resp = await session.get(api_url, **kw)
+            content_type = resp.headers.get("Content-Type", "")
 
-                if resp.status == 200 and "text/html" not in content_type:
-                    data = await resp.json(content_type=None)
-                    # /bonus: data["data"] adalah array (bisa [] utk event tanpa sesi bonus).
-                    if data.get("status") and data.get("data") is not None:
-                        return data["data"]
-                    print(f"     ⚠️  Status OK tapi struktur data tidak valid")
-                    return None
+            if resp.status_code == 200 and "text/html" not in content_type:
+                data = resp.json()
+                # /bonus: data["data"] array (bisa [] utk event selesai).
+                if data.get("status") and data.get("data") is not None:
+                    return data["data"]
+                print(f"     ⚠️  Status OK tapi struktur data tidak valid")
+                return None
 
-                elif "text/html" in content_type or resp.status in (403, 429, 503):
-                    print(f"     ⚠️  Kemungkinan Cloudflare waiting room "
-                          f"(status={resp.status}, attempt {attempt}/{max_retries})")
-                    await asyncio.sleep(5 * attempt)
-                    continue
+            elif "text/html" in content_type or resp.status_code in (403, 429, 503):
+                print(f"     ⚠️  Cloudflare challenge (status={resp.status_code}, "
+                      f"attempt {attempt}/{max_retries})")
+                await asyncio.sleep(5 * attempt)
+                continue
 
-                else:
-                    print(f"     ⚠️  HTTP {resp.status} untuk {api_url}")
-                    await asyncio.sleep(3 * attempt)
-                    continue
+            else:
+                print(f"     ⚠️  HTTP {resp.status_code} untuk {api_url}")
+                await asyncio.sleep(3 * attempt)
+                continue
 
-        except asyncio.TimeoutError:
-            print(f"     ⏱️  Timeout attempt {attempt}/{max_retries}")
-            await asyncio.sleep(5 * attempt)
-        except aiohttp.ClientError as e:
-            print(f"     ❌ Client error attempt {attempt}/{max_retries}: {e}")
-            await asyncio.sleep(5 * attempt)
         except Exception as e:
-            print(f"     ❌ Unexpected error: {e}")
-            return None
+            print(f"     ❌ Error attempt {attempt}/{max_retries}: {e}")
+            await asyncio.sleep(5 * attempt)
 
     print(f"     ❌ Semua {max_retries} attempt gagal untuk {api_url}")
     return None
@@ -505,6 +487,7 @@ async def monitor_loop():
     iteration = 0
     consecutive_errors = 0
     max_consecutive_errors = 10
+    inactive_events = set()   # event dengan /bonus kosong (selesai) — di-skip sampai discovery berikutnya
 
     try:
         while True:
@@ -562,9 +545,13 @@ async def monitor_loop():
                 all_endpoints    = get_all_monitored_endpoints({})
                 monitored_events = list(all_endpoints.keys())
 
-                print(f"  🎯 Monitoring {len(monitored_events)} events:")
-                for ev in monitored_events:
-                    print(f"     - {ev}")
+                # Tiap siklus discovery, re-cek semua event (event inaktif bisa jadi aktif lagi / baru ditemukan)
+                recheck_all = (iteration % DISCOVERY_INTERVAL == 1)
+                if recheck_all:
+                    inactive_events.clear()
+
+                active_count = len(monitored_events) - len([e for e in monitored_events if e in inactive_events])
+                print(f"  🎯 Monitoring {len(monitored_events)} events ({active_count} aktif, {len(inactive_events)} di-skip):")
 
                 event_status = {}
 
@@ -573,12 +560,19 @@ async def monitor_loop():
                     if not api_url:
                         event_status[event_name] = "SKIPPED"
                         continue
+
+                    # Skip event yang /bonus-nya kosong (event selesai) — hemat request/bandwidth.
+                    # Tetap di-cek ulang tiap siklus discovery (recheck_all).
+                    if event_name in inactive_events and not recheck_all:
+                        event_status[event_name] = "INACTIVE (skip)"
+                        continue
+
                     # Pastikan pakai endpoint /bonus (punya angka available_quota)
                     api_url = to_bonus_url(api_url)
 
                     print(f"\n  📡 [{event_name}]")
 
-                    # Fetch pakai aiohttp session persistent
+                    # Fetch pakai curl_cffi (impersonasi Chrome, lolos Cloudflare)
                     raw = await fetch_api_data_async(
                         session, api_url, extra_cookies=cf_cookies
                     )
@@ -592,9 +586,17 @@ async def monitor_loop():
                     # /bonus (array sesi) -> bentuk internal seragam (available_quota, tanpa tickets_sold)
                     new_data = normalize_bonus(raw)
                     session_count = len(new_data.get('session', []))
-                    print(f"     ✅ Fetched {session_count} sessions")
                     consecutive_errors = 0
 
+                    # /bonus kosong = event sudah selesai. Tandai inaktif & skip (jangan cemari summary/log).
+                    if session_count == 0:
+                        inactive_events.add(event_name)
+                        print(f"     ⏭️  /bonus kosong — event selesai, di-skip sampai discovery berikutnya")
+                        event_status[event_name] = "INACTIVE (bonus kosong)"
+                        continue
+
+                    inactive_events.discard(event_name)
+                    print(f"     ✅ Fetched {session_count} sessions")
                     all_fetched_data[event_name] = new_data
 
                     prev_data = previous_data.get(event_name)

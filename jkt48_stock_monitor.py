@@ -268,9 +268,13 @@ def fetch_api_data():
             st.error(f"Event tidak ditemukan: {st.session_state.selected_event}")
             return None
         
-        # Pakai endpoint /bonus (punya angka available_quota)
+        # Pakai endpoint /bonus (punya angka available_quota) + curl_cffi (lolos Cloudflare)
+        from curl_cffi import requests as cffi_requests
         api_url = to_bonus_url(api_url)
-        response = requests.get(api_url, timeout=10, proxies=proxy_pool.requests_proxies())
+        response = cffi_requests.get(
+            api_url, impersonate="chrome", timeout=15,
+            proxies=proxy_pool.requests_proxies()
+        )
         response.raise_for_status()
         data = response.json()
 
