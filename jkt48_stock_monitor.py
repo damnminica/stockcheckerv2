@@ -650,8 +650,8 @@ st.divider()
 # LANDING PAGE — Summary semua exclusive per kategori
 # ═══════════════════════════════════════════════════════════════════════════
 if view_mode == "📊 Summary Semua Exclusive":
-    # Auto-refresh setiap 30 detik — sinkron dengan interval background worker
-    st_autorefresh(interval=30_000, key="summary_autorefresh")
+    # Auto-refresh setiap 60 detik — sinkron dengan REFRESH_INTERVAL background worker
+    st_autorefresh(interval=60_000, key="summary_autorefresh")
     render_summary_page()
 
 # ═══════════════════════════════════════════════════════════════════════════

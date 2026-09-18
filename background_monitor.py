@@ -33,7 +33,7 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 # Semua event dikelola otomatis oleh exclusive_discovery.py
 # Tidak ada hardcode — dynamic_endpoints.json dikelola background worker
 
-REFRESH_INTERVAL = 30  # seconds
+REFRESH_INTERVAL = 60  # seconds (dinaikkan dari 30s untuk hemat kuota proxy)
 DISCOVERY_INTERVAL = 10  # Check for new exclusives every N iterations (~5 menit)
 CHANGE_LOG_FILE = "/mnt/user-data/outputs/change_log.json"
 PREVIOUS_DATA_FILE = "/mnt/user-data/outputs/previous_data.json"
