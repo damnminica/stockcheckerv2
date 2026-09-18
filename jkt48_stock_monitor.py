@@ -269,11 +269,20 @@ def fetch_api_data():
             return None
         
         # Pakai endpoint /bonus (punya angka available_quota) + curl_cffi (lolos Cloudflare)
+        import cf_solver
         from curl_cffi import requests as cffi_requests
         api_url = to_bonus_url(api_url)
+        proxies = proxy_pool.requests_proxies()
+        headers, cookies = {}, {}
+        if cf_solver.enabled() and proxies:
+            cf, ua = cf_solver.get_clearance(proxies.get("https"))
+            if cf:
+                cookies["cf_clearance"] = cf
+            if ua:
+                headers["User-Agent"] = ua
         response = cffi_requests.get(
-            api_url, impersonate="chrome", timeout=15,
-            proxies=proxy_pool.requests_proxies()
+            api_url, impersonate="chrome", timeout=20,
+            proxies=proxies, headers=headers or None, cookies=cookies or None
         )
         response.raise_for_status()
         data = response.json()

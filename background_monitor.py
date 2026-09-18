@@ -21,8 +21,33 @@ from exclusive_discovery import (
     get_all_monitored_endpoints,
 )
 import proxy_pool
+import cf_solver
 from jkt48_schema import to_bonus_url, normalize_bonus
 from curl_cffi.requests import AsyncSession
+
+
+def _current_proxy_url():
+    px = proxy_pool.requests_proxies()
+    return px.get("https") if px else None
+
+
+async def _apply_clearance(session, force=False):
+    """Solve/refresh cf_clearance (CapSolver) untuk proxy sticky, set di session
+    (cookie + User-Agent) supaya semua request lolos Cloudflare. No-op kalau CapSolver mati."""
+    if not cf_solver.enabled():
+        return
+    proxy_url = _current_proxy_url()
+    if not proxy_url:
+        return
+    loop = asyncio.get_event_loop()
+    cf, ua = await loop.run_in_executor(None, cf_solver.get_clearance, proxy_url, force)
+    if cf:
+        try:
+            session.cookies.set("cf_clearance", cf, domain=".jkt48.com")
+        except Exception:
+            session.cookies["cf_clearance"] = cf
+        if ua:
+            session.headers["User-Agent"] = ua
 
 # Constants
 WIB = pytz.timezone('Asia/Jakarta')
@@ -353,6 +378,10 @@ async def create_session():
         print(f"  🔌 Proxy pool aktif: {proxy_pool.count()} proxy (rotasi round-robin)")
     else:
         print("  🔌 Proxy: koneksi langsung (tanpa proxy)")
+    if cf_solver.enabled():
+        print("  🔓 CapSolver aktif — cf_clearance untuk lolos Cloudflare (butuh proxy STICKY)")
+    else:
+        print("  🔓 CapSolver: tidak aktif (set CAPSOLVER_API_KEY untuk aktifkan)")
     return session
 
 
@@ -384,6 +413,8 @@ async def fetch_api_data_async(session, api_url, extra_cookies=None, max_retries
             elif "text/html" in content_type or resp.status_code in (403, 429, 503):
                 print(f"     ⚠️  Cloudflare challenge (status={resp.status_code}, "
                       f"attempt {attempt}/{max_retries})")
+                # Paksa solve ulang cf_clearance (IP sticky mungkin rotasi / cookie kadaluarsa)
+                await _apply_clearance(session, force=True)
                 await asyncio.sleep(5 * attempt)
                 continue
 
@@ -513,6 +544,9 @@ async def monitor_loop():
                 cf_cookies = load_cf_cookie()
                 if cf_cookies:
                     print(f"  🍪 Manual CF cookie loaded (fallback)")
+
+                # Cloudflare clearance via CapSolver (dipakai semua request iterasi ini)
+                await _apply_clearance(session)
 
                 # ── Auto-discover exclusive baru ──────────────────────────
                 if iteration % DISCOVERY_INTERVAL == 1:
