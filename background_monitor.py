@@ -549,11 +549,18 @@ async def monitor_loop():
                 await _apply_clearance(session)
 
                 # ── Auto-discover exclusive baru ──────────────────────────
-                if iteration % DISCOVERY_INTERVAL == 1:
+                # Jalan tiap DISCOVERY_INTERVAL, ATAU saat SEMUA event inaktif
+                # (biar event aktif terbaru cepat ketemu, tak nunggu 10 iterasi).
+                _pre_events = list(get_all_monitored_endpoints({}).keys())
+                all_inactive = bool(_pre_events) and all(e in inactive_events for e in _pre_events)
+                run_discovery = (iteration % DISCOVERY_INTERVAL == 1) or all_inactive
+
+                if run_discovery:
                     try:
                         new_exclusives = await discover_new_exclusives_async(session)
                         if new_exclusives:
                             print(f"  🆕 {len(new_exclusives)} exclusive baru ditemukan!")
+                            inactive_events.clear()   # ada yang baru -> re-cek semua event
                         else:
                             print(f"  🔍 Discovery: tidak ada exclusive baru")
                     except Exception as e:
@@ -580,7 +587,7 @@ async def monitor_loop():
                 monitored_events = list(all_endpoints.keys())
 
                 # Tiap siklus discovery, re-cek semua event (event inaktif bisa jadi aktif lagi / baru ditemukan)
-                recheck_all = (iteration % DISCOVERY_INTERVAL == 1)
+                recheck_all = run_discovery
                 if recheck_all:
                     inactive_events.clear()
 

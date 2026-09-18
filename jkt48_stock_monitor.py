@@ -703,7 +703,13 @@ else:
         
         # Create DataFrame
         df = create_dataframe(data)
-        
+
+        # Event tanpa sesi bonus (selesai/inactive) -> df kosong. Jangan crash.
+        if df.empty:
+            st.info("Event ini tidak punya sesi bonus aktif (kemungkinan sudah selesai). "
+                    "Pilih event lain, atau tunggu worker menemukan event aktif terbaru.")
+            st.stop()
+
         # Statistics
         col1, col2, col3, col4, col5 = st.columns(5)
         

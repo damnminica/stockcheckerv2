@@ -194,58 +194,49 @@ def _process_raw_list(raw_list: list) -> list:
     new_found         = []
 
     for entry in raw_list:
-        exclusive_id = entry.get("exclusive_id")
-        if not exclusive_id:
+        # API list tidak lagi punya "exclusive_id" — pakai "code" sebagai identitas.
+        code = entry.get("code", "")
+        if not code:
             continue
-
-        eid_str = str(exclusive_id)
-        if eid_str in known:
+        if code in known:
             continue
 
         # ── Exclusive baru ────────────────────────────────────────────
         title      = (entry.get("title") or "").strip()
-        code       = entry.get("code", "")
         raw_cat    = entry.get("category", "")
         date_str   = entry.get("valid_date_from", "")
         short_desc = (entry.get("short_description") or "").strip()
         cat_label  = _format_category(raw_cat)
 
-        if not code:
-            print(f"  [Discovery] '{title}' has no code — skip monitoring")
-            known[eid_str] = {
-                "exclusive_id": exclusive_id, "title": title, "code": "",
-                "category": raw_cat, "discovered_at": now_wib().isoformat(),
-                "monitored": False, "reason": "no_code",
-            }
-            continue
-
         api_url      = _build_exclusive_api_url(code)
         purchase_url = _build_purchase_url(code)
         event_name   = f"{title} [{code}]"
 
-        if event_name not in dynamic_endpoints:
+        is_new_endpoint = event_name not in dynamic_endpoints
+        if is_new_endpoint:
             dynamic_endpoints[event_name] = api_url
             print(f"  [Discovery] ✨ NEW: '{title}' (code={code})")
         else:
             print(f"  [Discovery] Already tracked: '{title}'")
 
-        known[eid_str] = {
-            "exclusive_id": exclusive_id, "title": title, "code": code,
+        known[code] = {
+            "code": code, "title": title,
             "category": raw_cat, "category_label": cat_label,
             "api_url": api_url, "purchase_url": purchase_url,
             "short_description": short_desc, "valid_date_from": date_str,
             "discovered_at": now_wib().isoformat(),
             "monitored": True, "event_name": event_name,
         }
-        new_found.append(known[eid_str])
 
-        # Telegram notif
-        msg_lines = [f"*{title}*", f"Kategori: {cat_label}", f"Kode: `{code}`"]
-        if short_desc:
-            msg_lines.append(f"_{short_desc}_")
-        msg_lines.append(f"[Beli tiket]({purchase_url})")
-        msg_lines.append("\n📊 Dashboard sudah otomatis tracking exclusive ini.")
-        _send_telegram("\n".join(msg_lines))
+        # Hanya hitung & notif untuk endpoint yang BENAR-BENAR baru (bukan yang sudah tracked).
+        if is_new_endpoint:
+            new_found.append(known[code])
+            msg_lines = [f"*{title}*", f"Kategori: {cat_label}", f"Kode: `{code}`"]
+            if short_desc:
+                msg_lines.append(f"_{short_desc}_")
+            msg_lines.append(f"[Beli tiket]({purchase_url})")
+            msg_lines.append("\n📊 Dashboard sudah otomatis tracking exclusive ini.")
+            _send_telegram("\n".join(msg_lines))
 
     _save_known_exclusives(known)
     _save_dynamic_endpoints(dynamic_endpoints)
