@@ -155,7 +155,9 @@ def _save_dynamic_endpoints(data: dict):
 
 
 def _build_exclusive_api_url(code: str) -> str:
-    return f"https://jkt48.com/api/v1/exclusives/{code}?lang=id"
+    # Endpoint /bonus: menyediakan angka available_quota (sisa stok).
+    # Endpoint lama /exclusives/{code} hanya kasih boolean quota_available.
+    return f"https://jkt48.com/api/v1/exclusives/{code}/bonus?lang=id"
 
 
 def _build_purchase_url(code: str) -> str:

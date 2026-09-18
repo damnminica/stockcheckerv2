@@ -4,6 +4,7 @@ Runs 24/7 on Railway server - monitors stock changes and logs to file
 Optimized: WIB timezone only, Telegram only, +1 day event date offset
 Transport: aiohttp persistent session (bypass Cloudflare waiting room)
 """
+from __future__ import annotations
 
 import asyncio
 import aiohttp
@@ -20,6 +21,7 @@ from exclusive_discovery import (
     get_all_monitored_endpoints,
 )
 import proxy_pool
+from jkt48_schema import to_bonus_url, normalize_bonus
 
 # Constants
 WIB = pytz.timezone('Asia/Jakarta')
@@ -225,7 +227,7 @@ def build_and_save_summary_cache(all_event_data, known_raw):
     all_event_data: dict {event_name: raw_api_data}
     known_raw:      dict {event_name: metadata dari known_exclusives.json}
     """
-    # Flat list of rows: satu row per member per event
+    # Flat list of rows: satu row per member per event (AVAILABLE-ONLY, tanpa tickets_sold)
     rows = []
     for event_name, event_data in all_event_data.items():
         if not event_data:
@@ -236,28 +238,23 @@ def build_and_save_summary_cache(all_event_data, known_raw):
         category_label = CATEGORY_DISPLAY.get(category_raw, category_raw.replace("_", " ").title())
         event_title    = meta.get("title", event_name)
 
-        # Agregasi per member (sum semua session dalam satu event)
+        # Agregasi per member (sum available semua session dalam satu event)
         member_agg = {}
         for session in event_data.get('session', []):
             for detail in session.get('session_detail', []):
                 name  = detail['jkt48_member_name']
-                sold  = detail['tickets_sold']
-                avail = detail['available_quota']
-                total = sold + avail
+                avail = detail.get('available_quota', 0)
                 is_so = avail == 0
 
                 if name not in member_agg:
-                    member_agg[name] = {'sold': 0, 'avail': 0, 'total': 0, 'sessions': 0, 'so_sessions': 0}
-                member_agg[name]['sold']       += sold
-                member_agg[name]['avail']      += avail
-                member_agg[name]['total']      += total
-                member_agg[name]['sessions']   += 1
-                member_agg[name]['so_sessions'] += int(is_so)
+                    member_agg[name] = {'avail': 0, 'slots': 0, 'so_slots': 0}
+                member_agg[name]['avail']    += avail
+                member_agg[name]['slots']    += 1
+                member_agg[name]['so_slots'] += int(is_so)
 
         for member, agg in member_agg.items():
-            team    = MEMBER_TEAM_MAP.get(member, 'Unknown')
-            pct     = round(agg['sold'] / agg['total'] * 100, 1) if agg['total'] > 0 else 0.0
-            all_so  = agg['sessions'] > 0 and agg['so_sessions'] == agg['sessions']
+            team   = MEMBER_TEAM_MAP.get(member, 'Unknown')
+            all_so = agg['slots'] > 0 and agg['so_slots'] == agg['slots']
             rows.append({
                 'event_name':     event_name,
                 'event_title':    event_title,
@@ -265,10 +262,9 @@ def build_and_save_summary_cache(all_event_data, known_raw):
                 'category_label': category_label,
                 'member':         member,
                 'team':           team,
-                'tickets_sold':   agg['sold'],
                 'available':      agg['avail'],
-                'total':          agg['total'],
-                'sold_pct':       pct,
+                'slots':          agg['slots'],
+                'so_slots':       agg['so_slots'],
                 'all_sold_out':   all_so,
             })
 
@@ -283,33 +279,31 @@ def build_and_save_summary_cache(all_event_data, known_raw):
                 'category_raw':   r['category_raw'],
                 'category_label': r['category_label'],
                 'event_titles':   [],
-                'tickets_sold':   0,
                 'available':      0,
-                'total':          0,
+                'slots':          0,
+                'so_slots':       0,
                 'all_rows_so':    True,   # akan di-AND
             }
         g = grouped[key]
         if r['event_title'] not in g['event_titles']:
             g['event_titles'].append(r['event_title'])
-        g['tickets_sold'] += r['tickets_sold']
-        g['available']    += r['available']
-        g['total']        += r['total']
-        g['all_rows_so']   = g['all_rows_so'] and r['all_sold_out']
+        g['available'] += r['available']
+        g['slots']     += r['slots']
+        g['so_slots']  += r['so_slots']
+        g['all_rows_so'] = g['all_rows_so'] and r['all_sold_out']
 
     # Finalisasi
     summary_rows = []
     for g in grouped.values():
-        pct = round(g['tickets_sold'] / g['total'] * 100, 1) if g['total'] > 0 else 0.0
         summary_rows.append({
             'member':         g['member'],
             'team':           g['team'],
             'category_raw':   g['category_raw'],
             'category_label': g['category_label'],
             'event_titles':   g['event_titles'],
-            'tickets_sold':   g['tickets_sold'],
             'available':      g['available'],
-            'total':          g['total'],
-            'sold_pct':       pct,
+            'slots':          g['slots'],
+            'so_slots':       g['so_slots'],
             'all_sold_out':   g['all_rows_so'],
         })
 
@@ -393,7 +387,8 @@ async def fetch_api_data_async(
 
                 if resp.status == 200 and "text/html" not in content_type:
                     data = await resp.json(content_type=None)
-                    if data.get("status") and data.get("data"):
+                    # /bonus: data["data"] adalah array (bisa [] utk event tanpa sesi bonus).
+                    if data.get("status") and data.get("data") is not None:
                         return data["data"]
                     print(f"     ⚠️  Status OK tapi struktur data tidak valid")
                     return None
@@ -423,138 +418,74 @@ async def fetch_api_data_async(
     return None
 
 def detect_changes(new_data, prev_data, event_name, config):
-    """Detect stock changes"""
+    """
+    Deteksi perubahan stok — AVAILABLE-ONLY.
+    API /bonus tidak menyediakan tickets_sold, jadi hanya dua transisi dilacak:
+      - sold_out    : available > 0  -> 0   (member jadi habis)
+      - stock_return: available == 0 -> > 0 (stok balik/tersedia lagi)
+    """
     if not prev_data:
         return []
-    
+
     changes = []
-    
+
     for new_session in new_data.get('session', []):
         prev_session = next(
-            (s for s in prev_data.get('session', []) 
+            (s for s in prev_data.get('session', [])
              if s['label'] == new_session['label']),
             None
         )
-        
         if not prev_session:
             continue
-        
+
         # Get session date with +1 day offset for consistency
-        original_date = new_session.get('date', '')
-        adjusted_date = get_adjusted_event_date(original_date)
-        
+        adjusted_date = get_adjusted_event_date(new_session.get('date', ''))
+
         for new_detail in new_session['session_detail']:
             prev_detail = next(
                 (d for d in prev_session['session_detail']
                  if d['jkt48_member_name'] == new_detail['jkt48_member_name']),
                 None
             )
-            
             if not prev_detail:
                 continue
-            
-            new_available = new_detail['available_quota']
-            prev_available = prev_detail['available_quota']
-            new_sold = new_detail['tickets_sold']
-            prev_sold = prev_detail['tickets_sold']
-            
-            # 1. Stock return from sold out
+
+            new_available = new_detail.get('available_quota', 0)
+            prev_available = prev_detail.get('available_quota', 0)
+            member = new_detail['jkt48_member_name']
+
+            # Stok kembali: habis -> tersedia lagi
             if prev_available == 0 and new_available > 0:
-                change = {
+                changes.append({
                     'type': 'stock_return',
                     'event': event_name,
-                    'member': new_detail['jkt48_member_name'],
+                    'member': member,
                     'session': new_session['label'],
-                    'session_date': adjusted_date,  # YYYY-MM-DD format (+1 day)
+                    'session_date': adjusted_date,
                     'returned_quota': new_available,
-                    'refunded_tickets': prev_sold - new_sold if new_sold < prev_sold else 0,
-                    'timestamp': now_wib().isoformat()  # WIB timezone
-                }
-                changes.append(change)
-                
-                if change['refunded_tickets'] > 0:
-                    msg = f"♻️ *STOCK KEMBALI!* (Refund)\n[{event_name}]\n{change['member']} ({change['session']})\nSold Out → {new_available} tiket\n💳 {change['refunded_tickets']} dibatalkan"
-                else:
-                    msg = f"♻️ *STOCK KEMBALI!*\n[{event_name}]\n{change['member']} ({change['session']})\nSold Out → {new_available} tiket"
-                
-                send_telegram_notification(msg)
-            
-            # 2. Stock increase (not from sold out)
-            elif new_available > prev_available and prev_available > 0:
-                change = {
-                    'type': 'stock_increase',
-                    'event': event_name,
-                    'member': new_detail['jkt48_member_name'],
-                    'session': new_session['label'],
-                    'session_date': adjusted_date,
-                    'old_quota': prev_available,
-                    'new_quota': new_available,
-                    'difference': new_available - prev_available,
-                    'timestamp': now_wib().isoformat()
-                }
-                changes.append(change)
-                
-                msg = f"📈 *STOCK NAIK!*\n[{event_name}]\n{change['member']} ({change['session']})\n{change['old_quota']} → {change['new_quota']} (+{change['difference']})"
-                send_telegram_notification(msg)
-            
-            # 3. New transaction
-            elif new_sold > prev_sold:
-                sold_diff = new_sold - prev_sold
-                change = {
-                    'type': 'new_transaction',
-                    'event': event_name,
-                    'member': new_detail['jkt48_member_name'],
-                    'session': new_session['label'],
-                    'session_date': adjusted_date,
-                    'tickets_bought': sold_diff,
-                    'old_sold': prev_sold,
-                    'new_sold': new_sold,
-                    'remaining': new_available,
-                    'timestamp': now_wib().isoformat()
-                }
-                changes.append(change)
-                
-                # Only notify for significant purchases
-                if sold_diff >= 5 or new_available == 0:
-                    msg = f"🎫 *TRANSAKSI BARU!*\n[{event_name}]\n{change['member']} ({change['session']})\n{sold_diff} tiket terjual\nSisa: {new_available}"
-                    send_telegram_notification(msg)
-            
-            # 4. Refund (tickets_sold decreased)
-            elif new_sold < prev_sold and prev_available > 0:
-                refund_diff = prev_sold - new_sold
-                change = {
-                    'type': 'refund',
-                    'event': event_name,
-                    'member': new_detail['jkt48_member_name'],
-                    'session': new_session['label'],
-                    'session_date': adjusted_date,
-                    'refunded_tickets': refund_diff,
-                    'old_sold': prev_sold,
-                    'new_sold': new_sold,
-                    'new_available': new_available,
-                    'timestamp': now_wib().isoformat()
-                }
-                changes.append(change)
-                
-                msg = f"💳 *REFUND/CANCEL!*\n[{event_name}]\n{change['member']} ({change['session']})\n{refund_diff} dibatalkan\nStock: {new_available}"
-                send_telegram_notification(msg)
-            
-            # 5. Sold out
-            if new_available == 0 and prev_available > 0:
-                change = {
+                    'timestamp': now_wib().isoformat(),
+                })
+                send_telegram_notification(
+                    f"♻️ *STOCK KEMBALI!*\n[{event_name}]\n{member} ({new_session['label']})\n"
+                    f"Sold Out → {new_available} tersedia"
+                )
+
+            # Sold out: tersedia -> habis
+            elif prev_available > 0 and new_available == 0:
+                changes.append({
                     'type': 'sold_out',
                     'event': event_name,
-                    'member': new_detail['jkt48_member_name'],
+                    'member': member,
                     'session': new_session['label'],
                     'session_date': adjusted_date,
                     'last_available': prev_available,
-                    'timestamp': now_wib().isoformat()
-                }
-                changes.append(change)
-                
-                msg = f"🔴 *SOLD OUT!*\n[{event_name}]\n{change['member']} ({change['session']})\nHabis dari {change['last_available']} tiket!"
-                send_telegram_notification(msg)
-    
+                    'timestamp': now_wib().isoformat(),
+                })
+                send_telegram_notification(
+                    f"🔴 *SOLD OUT!*\n[{event_name}]\n{member} ({new_session['label']})\n"
+                    f"Habis dari {prev_available} tersedia!"
+                )
+
     return changes
 
 async def monitor_loop():
@@ -642,20 +573,24 @@ async def monitor_loop():
                     if not api_url:
                         event_status[event_name] = "SKIPPED"
                         continue
+                    # Pastikan pakai endpoint /bonus (punya angka available_quota)
+                    api_url = to_bonus_url(api_url)
 
                     print(f"\n  📡 [{event_name}]")
 
                     # Fetch pakai aiohttp session persistent
-                    new_data = await fetch_api_data_async(
+                    raw = await fetch_api_data_async(
                         session, api_url, extra_cookies=cf_cookies
                     )
 
-                    if not new_data:
+                    if raw is None:
                         print(f"     ❌ FETCH FAILED")
                         event_status[event_name] = "FETCH FAILED"
                         consecutive_errors += 1
                         continue
 
+                    # /bonus (array sesi) -> bentuk internal seragam (available_quota, tanpa tickets_sold)
+                    new_data = normalize_bonus(raw)
                     session_count = len(new_data.get('session', []))
                     print(f"     ✅ Fetched {session_count} sessions")
                     consecutive_errors = 0

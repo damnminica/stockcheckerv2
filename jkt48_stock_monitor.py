@@ -17,6 +17,7 @@ import pytz
 import locale
 import os
 import proxy_pool
+from jkt48_schema import to_bonus_url, normalize_bonus
 
 # Constants
 WIB = pytz.timezone('Asia/Jakarta')
@@ -267,12 +268,15 @@ def fetch_api_data():
             st.error(f"Event tidak ditemukan: {st.session_state.selected_event}")
             return None
         
+        # Pakai endpoint /bonus (punya angka available_quota)
+        api_url = to_bonus_url(api_url)
         response = requests.get(api_url, timeout=10, proxies=proxy_pool.requests_proxies())
         response.raise_for_status()
         data = response.json()
-        
-        if data.get('status') and data.get('data'):
-            return data['data']
+
+        if data.get('status') and data.get('data') is not None:
+            # /bonus: array sesi -> bentuk internal seragam (available_quota, tanpa tickets_sold)
+            return normalize_bonus(data['data'])
         return None
     except Exception as e:
         st.error(f"Error fetching API: {str(e)}")
@@ -294,148 +298,63 @@ def send_telegram_notification(message):
         return False
 
 def detect_changes(new_data):
-    """Detect stock changes and send notifications"""
+    """Deteksi perubahan stok (AVAILABLE-ONLY): sold_out & stock_return.
+    API /bonus tidak punya tickets_sold, jadi transaksi/refund tidak dilacak."""
     if not st.session_state.previous_data:
         st.session_state.previous_data = new_data
         return []
-    
+
     changes = []
     prev_data = st.session_state.previous_data
-    
+
     for new_session in new_data.get('session', []):
         prev_session = next(
-            (s for s in prev_data.get('session', []) 
+            (s for s in prev_data.get('session', [])
              if s['label'] == new_session['label'] and s['date'] == new_session['date']),
             None
         )
-        
         if not prev_session:
             continue
-        
+
         for new_detail in new_session['session_detail']:
             prev_detail = next(
                 (d for d in prev_session['session_detail']
                  if d['label'] == new_detail['label'] and d['jkt48_member_name'] == new_detail['jkt48_member_name']),
                 None
             )
-            
             if not prev_detail:
                 continue
-            
-            new_available = new_detail['available_quota']
-            prev_available = prev_detail['available_quota']
-            new_sold = new_detail['tickets_sold']
-            prev_sold = prev_detail['tickets_sold']
-            
-            # 1. Stock tersedia kembali setelah sold out (REFUND/CANCELLATION)
+
+            new_available = new_detail.get('available_quota', 0)
+            prev_available = prev_detail.get('available_quota', 0)
+            member = new_detail['jkt48_member_name']
+
+            # Stok kembali: habis -> tersedia lagi
             if prev_available == 0 and new_available > 0:
-                change = {
-                    'type': 'stock_return',
-                    'member': new_detail['jkt48_member_name'],
-                    'session': new_session['label'],
-                    'session_date': new_session.get('date', ''),  # Event date
-                    'returned_quota': new_available,
-                    'old_sold': prev_sold,
-                    'new_sold': new_sold,
-                    'refunded_tickets': prev_sold - new_sold if new_sold < prev_sold else 0,
-                    'timestamp': datetime.now()
-                }
-                changes.append(change)
-                
+                changes.append({
+                    'type': 'stock_return', 'member': member, 'session': new_session['label'],
+                    'session_date': new_session.get('date', ''), 'returned_quota': new_available,
+                    'timestamp': datetime.now(),
+                })
                 if st.session_state.notifications_enabled:
-                    if change['refunded_tickets'] > 0:
-                        msg = f"♻️ *STOCK KEMBALI!* (Refund/Cancel)\n{change['member']} ({change['session']})\nSold Out → {new_available} tiket tersedia\n💳 {change['refunded_tickets']} transaksi dibatalkan"
-                    else:
-                        msg = f"♻️ *STOCK KEMBALI!*\n{change['member']} ({change['session']})\nSold Out → {new_available} tiket tersedia\n(Kemungkinan tambahan quota)"
-                    send_telegram_notification(msg)
-            
-            # 2. Stock increase (quota naik tapi belum pernah sold out)
-            elif new_available > prev_available and prev_available > 0:
-                change = {
-                    'type': 'stock_increase',
-                    'member': new_detail['jkt48_member_name'],
-                    'session': new_session['label'],
-                    'session_date': new_session.get('date', ''),
-                    'old_quota': prev_available,
-                    'new_quota': new_available,
-                    'difference': new_available - prev_available,
-                    'timestamp': datetime.now()
-                }
-                changes.append(change)
-                
+                    send_telegram_notification(
+                        f"♻️ *STOCK KEMBALI!*\n{member} ({new_session['label']})\nSold Out → {new_available} tersedia")
+
+            # Sold out: tersedia -> habis
+            elif prev_available > 0 and new_available == 0:
+                changes.append({
+                    'type': 'sold_out', 'member': member, 'session': new_session['label'],
+                    'session_date': new_session.get('date', ''), 'last_available': prev_available,
+                    'timestamp': datetime.now(),
+                })
                 if st.session_state.notifications_enabled:
-                    msg = f"📈 *STOCK NAIK!*\n{change['member']} ({change['session']})\n{change['old_quota']} → {change['new_quota']} (+{change['difference']})"
-                    send_telegram_notification(msg)
-            
-            # 3. New transaction (tickets_sold bertambah)
-            elif new_sold > prev_sold:
-                sold_diff = new_sold - prev_sold
-                change = {
-                    'type': 'new_transaction',
-                    'member': new_detail['jkt48_member_name'],
-                    'session': new_session['label'],
-                    'session_date': new_session.get('date', ''),
-                    'old_sold': prev_sold,
-                    'new_sold': new_sold,
-                    'tickets_bought': sold_diff,
-                    'remaining': new_available,
-                    'timestamp': datetime.now()
-                }
-                changes.append(change)
-                
-                if st.session_state.notifications_enabled:
-                    # Only notify if significant purchase (>= 5 tickets or sold out)
-                    if sold_diff >= 5 or new_available == 0:
-                        msg = f"🎫 *TRANSAKSI BARU!*\n{change['member']} ({change['session']})\n{sold_diff} tiket terjual\nSisa: {new_available}"
-                        send_telegram_notification(msg)
-            
-            # 4. Refund/Cancellation (tickets_sold berkurang)
-            elif new_sold < prev_sold and prev_available > 0:
-                refund_diff = prev_sold - new_sold
-                change = {
-                    'type': 'refund',
-                    'member': new_detail['jkt48_member_name'],
-                    'session': new_session['label'],
-                    'session_date': new_session.get('date', ''),
-                    'old_sold': prev_sold,
-                    'new_sold': new_sold,
-                    'refunded_tickets': refund_diff,
-                    'new_available': new_available,
-                    'timestamp': datetime.now()
-                }
-                changes.append(change)
-                
-                if st.session_state.notifications_enabled:
-                    # Notify for any refund
-                    msg = f"💳 *REFUND/CANCEL!*\n{change['member']} ({change['session']})\n{refund_diff} transaksi dibatalkan\nStock kembali: {new_available}"
-                    send_telegram_notification(msg)
-            
-            # 5. Sold out (available jadi 0)
-            if new_available == 0 and prev_available > 0:
-                change = {
-                    'type': 'sold_out',
-                    'member': new_detail['jkt48_member_name'],
-                    'session': new_session['label'],
-                    'session_date': new_session.get('date', ''),
-                    'last_available': prev_available,
-                    'timestamp': datetime.now()
-                }
-                changes.append(change)
-                
-                if st.session_state.notifications_enabled:
-                    msg = f"🔴 *SOLD OUT!*\n{change['member']} ({change['session']})\nHabis dari {change['last_available']} tiket!"
-                    send_telegram_notification(msg)
-    
+                    send_telegram_notification(
+                        f"🔴 *SOLD OUT!*\n{member} ({new_session['label']})\nHabis dari {prev_available} tersedia!")
+
     if changes:
         st.session_state.change_log.extend(changes)
         st.session_state.previous_data = new_data
-    
-    return changes
-    
-    if changes:
-        st.session_state.change_log.extend(changes)
-        st.session_state.previous_data = new_data
-    
+
     return changes
 
 def create_dataframe(data):
@@ -449,9 +368,8 @@ def create_dataframe(data):
         
         for detail in session['session_detail']:
             team = MEMBER_TEAM_MAP.get(detail['jkt48_member_name'], 'Unknown')
-            total_quota = detail['tickets_sold'] + detail['available_quota']
-            percentage = (detail['tickets_sold'] / total_quota * 100) if total_quota > 0 else 0
-            
+            avail = detail.get('available_quota', 0)
+
             rows.append({
                 'Session': session['label'],
                 'Date': adjusted_date,  # YYYY-MM-DD format for filtering
@@ -460,14 +378,11 @@ def create_dataframe(data):
                 'Lane': detail['label'],
                 'Member': detail['jkt48_member_name'],
                 'Team': team,
-                'Tickets Sold': detail['tickets_sold'],
-                'Available': detail['available_quota'],
-                'Total': total_quota,
-                'Sold %': round(percentage, 1),
-                'Status': 'Sold Out' if detail['available_quota'] == 0 else 
-                         'Low Stock' if detail['available_quota'] < 20 else 'Available'
+                'Available': avail,
+                'Status': 'Sold Out' if avail == 0 else
+                         'Low Stock' if avail < 20 else 'Available'
             })
-    
+
     return pd.DataFrame(rows)
 
 # Mapping kategori API → label ringkas untuk summary
@@ -523,9 +438,13 @@ def render_summary_page():
 
     rows = cache['rows']
     df_all = pd.DataFrame(rows)
-    # Cache dari background_monitor sudah di-grouped per member × kategori
-    # Tidak perlu groupby lagi — langsung pakai df_all
-    df_grouped = df_all.copy()
+
+    # Guard: cache format lama (punya tickets_sold, belum ada slots/so_slots) —
+    # bisa muncul beberapa detik setelah deploy sebelum worker menimpanya.
+    required_cols = {'available', 'slots', 'so_slots', 'all_sold_out', 'category_raw', 'team', 'member'}
+    if not required_cols.issubset(df_all.columns):
+        st.info("Menyinkronkan format data baru dari worker… tunggu ~30 detik lalu refresh.")
+        return
 
     # ── Tabs per kategori ─────────────────────────────────────────────────
     # Urutkan kategori yang tersedia sesuai CATEGORY_ORDER
@@ -538,15 +457,16 @@ def render_summary_page():
     tab_labels = [f"{cat_icons.get(c, '💎')} {CATEGORY_DISPLAY.get(c, c)}" for c in cats_ordered]
 
     # ── Top-level metrics (cross-kategori) ───────────────────────────────
-    total_sold  = df_all['tickets_sold'].sum()
-    total_avail = df_all['available'].sum()
-    total_so    = df_all[df_all['all_sold_out']]['member'].nunique()
-    n_events    = cache.get('total_events', 0)
-    n_members   = df_all['member'].nunique()
+    total_avail    = df_all['available'].sum()
+    total_slots    = df_all['slots'].sum()
+    total_so_slots = df_all['so_slots'].sum()
+    total_so       = df_all[df_all['all_sold_out']]['member'].nunique()
+    n_events       = cache.get('total_events', 0)
+    n_members      = df_all['member'].nunique()
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total Terjual",   f"{total_sold:,}")
-    c2.metric("Tersisa",         f"{total_avail:,}")
+    c1.metric("Total Tersedia",  f"{total_avail:,}")
+    c2.metric("Slot Sold Out",   f"{total_so_slots:,}/{total_slots:,}")
     c3.metric("Member Sold Out", f"{total_so}")
     c4.metric("Exclusive Aktif", f"{n_events}")
     c5.metric("Member Terlibat", f"{n_members}")
@@ -575,12 +495,11 @@ def render_summary_page():
 
             # ── Metric ringkas per kategori ───────────────────────────────
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Terjual",     f"{df_cat['tickets_sold'].sum():,}")
-            m2.metric("Tersisa",     f"{df_cat['available'].sum():,}")
-            sold_pct_cat = (df_cat['tickets_sold'].sum() / df_cat['total'].sum() * 100) if df_cat['total'].sum() > 0 else 0
-            m3.metric("Avg sold",    f"{sold_pct_cat:.1f}%")
+            m1.metric("Tersedia",       f"{df_cat['available'].sum():,}")
+            m2.metric("Total Slot",     f"{df_cat['slots'].sum():,}")
+            m3.metric("Slot Sold Out",  f"{df_cat['so_slots'].sum():,}")
             so_count = df_cat[df_cat['all_sold_out']].shape[0]
-            m4.metric("Sold Out",    f"{so_count} member")
+            m4.metric("Member Sold Out", f"{so_count}")
 
             st.divider()
 
@@ -590,39 +509,35 @@ def render_summary_page():
 
             for team in teams_present:
                 df_team = df_cat[df_cat['team'] == team].copy()
-                df_team = df_team.sort_values('tickets_sold', ascending=False)
+                df_team = df_team.sort_values('available', ascending=False)
 
                 color = TEAM_COLORS.get(team, '#888888')
-                team_sold  = df_team['tickets_sold'].sum()
-                team_avail = df_team['available'].sum()
-                team_total = df_team['total'].sum()
-                team_pct   = (team_sold / team_total * 100) if team_total > 0 else 0
-                team_so    = df_team[df_team['all_sold_out']].shape[0]
+                team_avail    = df_team['available'].sum()
+                team_slots    = df_team['slots'].sum()
+                team_so_slots = df_team['so_slots'].sum()
+                team_so       = df_team[df_team['all_sold_out']].shape[0]
 
-                # Header tim + grid kartu digabung jadi SATU st.markdown per tim.
-                # Sebelumnya: 1 header + st.columns(4) + N st.markdown per member
-                # (ratusan elemen tiap render). Sekarang: 1 elemen/tim, grid CSS responsif.
+                # Header tim + grid kartu digabung jadi SATU st.markdown per tim (grid CSS responsif).
                 cards = []
                 for row in df_team.to_dict('records'):
-                    sold, avail, total = row['tickets_sold'], row['available'], row['total']
-                    pct, is_so = row['sold_pct'], row['all_sold_out']
+                    avail = row['available']
+                    is_so = row['all_sold_out']
 
                     if is_so:
                         card_bg = "#ffebee"
                         badge = "<span style='background:#f44336;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;font-weight:700;'>SOLD OUT</span>"
-                    elif pct >= 80:
+                    elif avail <= 5:
                         card_bg = "#fff8e1"
-                        badge = f"<span style='background:#ff9800;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;font-weight:700;'>HOT {pct:.0f}%</span>"
+                        badge = f"<span style='background:#ff9800;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;font-weight:700;'>SISA {avail}</span>"
                     else:
                         card_bg = "#f5f5f5"
-                        badge = f"<span style='background:#4caf50;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;'>{pct:.0f}%</span>"
+                        badge = "<span style='background:#4caf50;color:white;padding:2px 7px;border-radius:10px;font-size:0.72em;'>TERSEDIA</span>"
 
                     cards.append(
-                        f"<div style='background:{card_bg};border-radius:8px;padding:10px 12px;min-height:90px;'>"
+                        f"<div style='background:{card_bg};border-radius:8px;padding:10px 12px;min-height:78px;'>"
                         f"<div style='font-weight:600;font-size:0.88em;margin-bottom:4px;color:#222;'>{row['member']}</div>"
                         f"{badge}"
-                        f"<div style='margin-top:6px;font-size:0.82em;color:#555;'>🎫 {sold:,} / {total:,}</div>"
-                        f"<div style='font-size:0.78em;color:#888;'>Sisa {avail:,}</div>"
+                        f"<div style='margin-top:6px;font-size:0.82em;color:#555;'>Sisa stok: {avail:,}</div>"
                         f"</div>"
                     )
 
@@ -631,7 +546,7 @@ def render_summary_page():
                     f"padding:10px 14px;border-radius:6px;margin-bottom:8px;'>"
                     f"<span style='color:{color};font-weight:700;font-size:1.05em;'>Team {team}</span>"
                     f"&nbsp;&nbsp;<span style='color:#888;font-size:0.9em;'>"
-                    f"{len(df_team)} member · {team_sold:,} terjual · {team_avail:,} tersisa · {team_pct:.1f}% · {team_so} sold out"
+                    f"{len(df_team)} member · {team_avail:,} tersisa · {team_so_slots:,}/{team_slots:,} slot habis · {team_so} member habis"
                     f"</span></div>"
                 )
                 grid = (
@@ -781,30 +696,29 @@ else:
         
         with col1:
             st.metric(
-                "Total Sold",
-                f"{df['Tickets Sold'].sum():,}",
-                f"{df['Sold %'].mean():.1f}%"
-            )
-        
-        with col2:
-            st.metric(
-                "Available",
+                "Total Tersedia",
                 f"{df['Available'].sum():,}"
             )
-        
+
+        with col2:
+            st.metric(
+                "Member / Slot",
+                f"{df['Member'].nunique()} / {len(df)}"
+            )
+
         with col3:
             sold_out_count = len(df[df['Status'] == 'Sold Out'])
             st.metric(
-                "Sold Out",
+                "Slot Sold Out",
                 sold_out_count
             )
-        
+
         with col4:
             st.metric(
                 "Changes",
                 len(st.session_state.change_log)
             )
-        
+
         with col5:
             wib = pytz.timezone('Asia/Jakarta')
             current_time_wib = datetime.now(pytz.UTC).astimezone(wib)
@@ -813,20 +727,20 @@ else:
                 current_time_wib.strftime("%H:%M:%S")
     )
         # Tabs
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "👥 Per Team", "📋 Data Table", "📜 Change Log", "⚡ Speed Tracker"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "👥 Per Team", "📋 Data Table", "📜 Change Log"])
         
         with tab1:
             col1, col2 = st.columns(2)
             
             with col1:
-                # Top Members
-                top_members = df.groupby('Member')['Tickets Sold'].sum().sort_values(ascending=False).head(10)
+                # Top Members by sisa stok
+                top_members = df.groupby('Member')['Available'].sum().sort_values(ascending=False).head(10)
                 fig = px.bar(
                     x=top_members.values,
                     y=top_members.index,
                     orientation='h',
-                    title="Top 10 Members - Tickets Sold",
-                    labels={'x': 'Tickets Sold', 'y': 'Member'},
+                    title="Top 10 Members - Sisa Stok Terbanyak",
+                    labels={'x': 'Sisa Stok', 'y': 'Member'},
                     color=top_members.values,
                     color_continuous_scale='viridis'
                 )
@@ -851,48 +765,47 @@ else:
                 st.plotly_chart(fig, use_container_width=True)
         
         with tab2:
-            # Team analysis
+            # Team analysis (available-only)
             team_stats = df.groupby('Team').agg({
-                'Tickets Sold': 'sum',
                 'Available': 'sum',
                 'Member': 'nunique'
             }).reset_index()
-            team_stats.columns = ['Team', 'Total Sold', 'Available', 'Member Count']
-            team_stats['Avg per Member'] = (team_stats['Total Sold'] / team_stats['Member Count']).round(0)
-            
-            # Team sales chart
+            team_stats.columns = ['Team', 'Available', 'Member Count']
+            team_stats['Avg per Member'] = (team_stats['Available'] / team_stats['Member Count']).round(0)
+
+            # Available per team chart
             fig = px.bar(
                 team_stats,
                 x='Team',
-                y='Total Sold',
-                title="Sales per Team",
+                y='Available',
+                title="Sisa Stok per Team",
                 color='Team',
                 color_discrete_map=TEAM_COLORS,
-                text='Total Sold'
+                text='Available'
             )
             fig.update_traces(textposition='outside')
             fig.update_layout(showlegend=False, height=400)
             st.plotly_chart(fig, use_container_width=True)
-            
+
             # Team cards
             cols = st.columns(len(team_stats))
             for idx, (_, team) in enumerate(team_stats.iterrows()):
                 with cols[idx]:
                     st.markdown(f"""
-                    <div style="background: {TEAM_COLORS.get(team['Team'], '#667eea')}; 
+                    <div style="background: {TEAM_COLORS.get(team['Team'], '#667eea')};
                                 padding: 1rem; border-radius: 0.5rem; color: white;">
                         <h3 style="margin: 0;">Team {team['Team']}</h3>
-                        <p style="font-size: 2em; margin: 0.5rem 0; font-weight: bold;">{int(team['Total Sold'])}</p>
+                        <p style="font-size: 2em; margin: 0.5rem 0; font-weight: bold;">{int(team['Available'])}</p>
                         <p style="margin: 0; opacity: 0.9;">{int(team['Member Count'])} members</p>
-                        <p style="margin: 0; opacity: 0.9;">Avg: {int(team['Avg per Member'])}/member</p>
+                        <p style="margin: 0; opacity: 0.9;">Avg sisa: {int(team['Avg per Member'])}/member</p>
                     </div>
                     """, unsafe_allow_html=True)
-            
+
             # Members by team
             st.subheader("Members by Team")
             for team in team_stats['Team'].unique():
                 with st.expander(f"Team {team} ({len(df[df['Team'] == team]['Member'].unique())} members)"):
-                    team_df = df[df['Team'] == team].groupby('Member')['Tickets Sold'].sum().sort_values(ascending=False)
+                    team_df = df[df['Team'] == team].groupby('Member')['Available'].sum().sort_values(ascending=False)
                     st.dataframe(
                         team_df.reset_index(),
                         use_container_width=True,
@@ -1287,178 +1200,6 @@ else:
             else:
                 st.info("No changes detected yet. Background worker is monitoring 24/7!")
 
-        with tab5:
-            # ── Speed Tracker ────────────────────────────────────────────
-            st.subheader("⚡ Sold-Out Speed Tracker")
-            st.caption("Analisis kecepatan penjualan per member dari change log historis")
-
-            # Load semua change log
-            raw_log = load_change_log_from_file() + st.session_state.get('change_log', [])
-            txns = [e for e in raw_log if e.get('type') == 'new_transaction']
-
-            if not txns:
-                st.info("Belum ada data transaksi di change log. Tracker akan aktif begitu ada pembelian terdeteksi.")
-            else:
-                from collections import defaultdict
-
-                # ── Build per-member stats dari change log ────────────────
-                groups = defaultdict(list)
-                for t in txns:
-                    key = (t.get('event', ''), t.get('member', ''), t.get('session', ''))
-                    groups[key].append(t)
-
-                # Sort tiap group by timestamp
-                for key in groups:
-                    groups[key].sort(key=lambda x: x.get('timestamp', ''))
-
-                stats = []
-                for (event, member, session), entries in groups.items():
-                    if not member or not entries:
-                        continue
-
-                    try:
-                        first_ts = datetime.fromisoformat(entries[0]['timestamp']).astimezone(WIB)
-                        last_ts  = datetime.fromisoformat(entries[-1]['timestamp']).astimezone(WIB)
-                    except Exception:
-                        continue
-
-                    total_bought  = sum(e.get('tickets_bought', 0) for e in entries)
-                    duration_secs = (last_ts - first_ts).total_seconds()
-                    duration_hrs  = duration_secs / 3600
-
-                    # Time-to-first-sale: cari entri pertama dengan old_sold == 0
-                    first_sale_entry = next(
-                        (e for e in entries if e.get('old_sold', -1) == 0), None
-                    )
-
-                    # Speed: total tiket / durasi (hindari div/0 kalau hanya 1 transaksi)
-                    speed_per_hour = round(total_bought / duration_hrs, 2) if duration_hrs > 0.01 else None
-
-                    team = MEMBER_TEAM_MAP.get(member, 'Unknown')
-
-                    stats.append({
-                        'event':            event,
-                        'member':           member,
-                        'team':             team,
-                        'session':          session,
-                        'first_txn':        first_ts,
-                        'last_txn':         last_ts,
-                        'total_tickets':    total_bought,
-                        'n_transactions':   len(entries),
-                        'duration_hrs':     round(duration_hrs, 1),
-                        'speed_per_hour':   speed_per_hour,
-                        'has_first_sale':   first_sale_entry is not None,
-                        'first_sale_ts':    first_ts if first_sale_entry else None,
-                        'first_sale_qty':   first_sale_entry.get('tickets_bought', 0) if first_sale_entry else 0,
-                    })
-
-                if not stats:
-                    st.info("Belum cukup data untuk analisis speed.")
-                else:
-                    df_speed = pd.DataFrame(stats)
-
-                    # ── Filter event ──────────────────────────────────────
-                    events_available = sorted(df_speed['event'].unique())
-                    selected_events  = st.multiselect(
-                        "Filter Event", events_available, default=events_available,
-                        key="speed_event_filter"
-                    )
-                    df_speed = df_speed[df_speed['event'].isin(selected_events)]
-
-                    st.divider()
-
-                    # ── Metric summary row ────────────────────────────────
-                    fastest = df_speed[df_speed['speed_per_hour'].notna()].nlargest(1, 'speed_per_hour')
-                    most_txns = df_speed.nlargest(1, 'total_tickets')
-                    first_buyers = df_speed[df_speed['has_first_sale']]
-
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Member Dianalisis", len(df_speed))
-                    c2.metric("Total Tiket Terjual", f"{df_speed['total_tickets'].sum():,}")
-                    if not fastest.empty:
-                        c3.metric(
-                            "Tercepat",
-                            fastest.iloc[0]['member'].split()[0],
-                            f"{fastest.iloc[0]['speed_per_hour']:.1f} tiket/jam"
-                        )
-                    if not most_txns.empty:
-                        c4.metric(
-                            "Terbanyak",
-                            most_txns.iloc[0]['member'].split()[0],
-                            f"{most_txns.iloc[0]['total_tickets']:,} tiket"
-                        )
-
-                    st.divider()
-
-                    # ── Chart 1: Speed per hour per member ───────────────
-                    df_chart = (
-                        df_speed[df_speed['speed_per_hour'].notna()]
-                        .sort_values('speed_per_hour', ascending=True)
-                    )
-
-                    if not df_chart.empty:
-                        color_map = {
-                            'LOVE': '#ff1744', 'PASSION': '#2979ff',
-                            'DREAM': '#00c853', 'TRAINEE': '#9c27b0', 'Unknown': '#888'
-                        }
-                        df_chart['color'] = df_chart['team'].map(color_map).fillna('#888')
-                        df_chart['label'] = df_chart['member'] + ' (' + df_chart['session'] + ')'
-
-                        fig_speed = px.bar(
-                            df_chart,
-                            x='speed_per_hour',
-                            y='label',
-                            orientation='h',
-                            color='team',
-                            color_discrete_map=color_map,
-                            title="🚀 Kecepatan Penjualan (tiket/jam)",
-                            labels={'speed_per_hour': 'Tiket/Jam', 'label': ''},
-                            text='speed_per_hour',
-                        )
-                        fig_speed.update_traces(texttemplate='%{text:.1f}', textposition='outside')
-                        fig_speed.update_layout(
-                            height=max(300, len(df_chart) * 35),
-                            showlegend=True,
-                            legend_title="Team",
-                        )
-                        st.plotly_chart(fig_speed, use_container_width=True)
-
-                    # ── Chart 2: Time-to-first-sale ───────────────────────
-                    st.divider()
-                    st.markdown("#### ⭐ Time-to-First-Sale")
-                    st.caption("Member dengan `old_sold = 0` di transaksi pertama mereka — artinya terdeteksi sejak tiket pertama dibeli.")
-
-                    df_first = df_speed[df_speed['has_first_sale']].copy()
-                    if df_first.empty:
-                        st.info("Belum ada data first-sale terdeteksi. Butuh monitoring sejak sales dibuka.")
-                    else:
-                        for _, row in df_first.sort_values('first_txn').iterrows():
-                            color = {'LOVE': '#ff1744', 'PASSION': '#2979ff',
-                                     'DREAM': '#00c853', 'TRAINEE': '#9c27b0'}.get(row['team'], '#888')
-                            st.markdown(
-                                f"<div style='border-left:4px solid {color}; padding:8px 14px; "
-                                f"margin-bottom:6px; background:{color}11; border-radius:4px;'>"
-                                f"<strong style='color:{color}'>{row['member']}</strong> "
-                                f"<span style='color:#888; font-size:0.85em'>({row['session']} · {row['event'][:20]})</span><br>"
-                                f"First sale: <strong>{row['first_sale_ts'].strftime('%d/%m/%Y %H:%M WIB')}</strong> "
-                                f"— {row['first_sale_qty']} tiket langsung"
-                                f"</div>",
-                                unsafe_allow_html=True
-                            )
-
-                    # ── Tabel detail ──────────────────────────────────────
-                    st.divider()
-                    st.markdown("#### 📋 Detail per Member")
-                    df_table = df_speed[[
-                        'member', 'team', 'session', 'event',
-                        'total_tickets', 'n_transactions', 'duration_hrs', 'speed_per_hour'
-                    ]].copy()
-                    df_table.columns = [
-                        'Member', 'Team', 'Sesi', 'Event',
-                        'Total Tiket', 'Transaksi', 'Durasi (jam)', 'Tiket/Jam'
-                    ]
-                    df_table = df_table.sort_values('Tiket/Jam', ascending=False, na_position='last')
-                    st.dataframe(df_table, use_container_width=True, hide_index=True)
     
     else:
         st.error("❌ Failed to fetch data from API")
