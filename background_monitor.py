@@ -19,6 +19,7 @@ from exclusive_discovery import (
     discover_new_exclusives_async,
     get_all_monitored_endpoints,
 )
+import proxy_pool
 
 # Constants
 WIB = pytz.timezone('Asia/Jakarta')
@@ -360,6 +361,10 @@ async def create_session() -> aiohttp.ClientSession:
         cookie_jar=aiohttp.CookieJar(),   # persistent across requests
     )
     print("  🌐 aiohttp session created (persistent cookie jar)")
+    if proxy_pool.has_proxies():
+        print(f"  🔌 Proxy pool aktif: {proxy_pool.count()} proxy (rotasi round-robin)")
+    else:
+        print("  🔌 Proxy: tidak ada (koneksi langsung) — set JKT48_PROXY_LIST untuk aktifkan")
     return session
 
 
@@ -380,6 +385,8 @@ async def fetch_api_data_async(
             kwargs = {}
             if extra_cookies:
                 kwargs['cookies'] = extra_cookies
+            # Rotasi proxy per attempt: attempt gagal -> retry pakai IP lain
+            kwargs.update(proxy_pool.aiohttp_kwargs())
 
             async with session.get(api_url, allow_redirects=True, **kwargs) as resp:
                 content_type = resp.headers.get("Content-Type", "")

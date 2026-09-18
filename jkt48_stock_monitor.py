@@ -16,6 +16,7 @@ from streamlit_autorefresh import st_autorefresh
 import pytz
 import locale
 import os
+import proxy_pool
 
 # Constants
 WIB = pytz.timezone('Asia/Jakarta')
@@ -266,7 +267,7 @@ def fetch_api_data():
             st.error(f"Event tidak ditemukan: {st.session_state.selected_event}")
             return None
         
-        response = requests.get(api_url, timeout=10)
+        response = requests.get(api_url, timeout=10, proxies=proxy_pool.requests_proxies())
         response.raise_for_status()
         data = response.json()
         

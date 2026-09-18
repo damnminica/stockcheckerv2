@@ -18,6 +18,7 @@ import time
 import requests  # hanya untuk Telegram dan fallback standalone
 from datetime import datetime
 import pytz
+import proxy_pool
 
 WIB = pytz.timezone('Asia/Jakarta')
 
@@ -71,7 +72,8 @@ async def _fetch_exclusives_list_async(session) -> list:
     for attempt in range(1, 4):
         try:
             async with session.get(
-                EXCLUSIVES_LIST_API, allow_redirects=True
+                EXCLUSIVES_LIST_API, allow_redirects=True,
+                **proxy_pool.aiohttp_kwargs()
             ) as resp:
                 content_type = resp.headers.get("Content-Type", "")
                 if resp.status == 200 and "text/html" not in content_type:
@@ -97,7 +99,8 @@ def _fetch_exclusives_list_sync() -> list:
     for attempt in range(3):
         try:
             resp = requests.get(
-                EXCLUSIVES_LIST_API, headers=_HEADERS, timeout=15
+                EXCLUSIVES_LIST_API, headers=_HEADERS, timeout=15,
+                proxies=proxy_pool.requests_proxies()
             )
             content_type = resp.headers.get("Content-Type", "")
             if "text/html" in content_type:
