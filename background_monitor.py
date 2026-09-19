@@ -60,6 +60,7 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 # Tidak ada hardcode — dynamic_endpoints.json dikelola background worker
 
 REFRESH_INTERVAL = 60  # seconds (dinaikkan dari 30s untuk hemat kuota proxy)
+NOTIFY_DECREASE_MIN = 1  # kirim Telegram utk stok berkurang bila selisih >= nilai ini (semua perubahan tetap dicatat)
 DISCOVERY_INTERVAL = 10  # Check for new exclusives every N iterations (~5 menit)
 CHANGE_LOG_FILE = "/mnt/user-data/outputs/change_log.json"
 PREVIOUS_DATA_FILE = "/mnt/user-data/outputs/previous_data.json"
@@ -432,10 +433,11 @@ async def fetch_api_data_async(session, api_url, extra_cookies=None, max_retries
 
 def detect_changes(new_data, prev_data, event_name, config):
     """
-    Deteksi perubahan stok — AVAILABLE-ONLY.
-    API /bonus tidak menyediakan tickets_sold, jadi hanya dua transisi dilacak:
-      - sold_out    : available > 0  -> 0   (member jadi habis)
-      - stock_return: available == 0 -> > 0 (stok balik/tersedia lagi)
+    Deteksi perubahan stok dari available_quota (API /bonus, tanpa tickets_sold):
+      - sold_out      : available > 0  -> 0            (habis)
+      - stock_return  : available == 0 -> > 0          (stok balik)
+      - stock_decrease: available turun (>0 -> >0)     (kemungkinan pembelian)
+      - stock_increase: available naik (>0 -> lebih)   (tambahan kuota)
     """
     if not prev_data:
         return []
@@ -467,37 +469,57 @@ def detect_changes(new_data, prev_data, event_name, config):
             prev_available = prev_detail.get('available_quota', 0)
             member = new_detail['jkt48_member_name']
 
-            # Stok kembali: habis -> tersedia lagi
-            if prev_available == 0 and new_available > 0:
-                changes.append({
-                    'type': 'stock_return',
-                    'event': event_name,
-                    'member': member,
-                    'session': new_session['label'],
-                    'session_date': adjusted_date,
-                    'returned_quota': new_available,
-                    'timestamp': now_wib().isoformat(),
-                })
-                send_telegram_notification(
-                    f"♻️ *STOCK KEMBALI!*\n[{event_name}]\n{member} ({new_session['label']})\n"
-                    f"Sold Out → {new_available} tersedia"
-                )
+            sess = new_session['label']
 
-            # Sold out: tersedia -> habis
-            elif prev_available > 0 and new_available == 0:
+            # 1. Sold out: tersedia -> habis
+            if prev_available > 0 and new_available == 0:
                 changes.append({
-                    'type': 'sold_out',
-                    'event': event_name,
-                    'member': member,
-                    'session': new_session['label'],
-                    'session_date': adjusted_date,
-                    'last_available': prev_available,
-                    'timestamp': now_wib().isoformat(),
+                    'type': 'sold_out', 'event': event_name, 'member': member,
+                    'session': sess, 'session_date': adjusted_date,
+                    'last_available': prev_available, 'timestamp': now_wib().isoformat(),
                 })
                 send_telegram_notification(
-                    f"🔴 *SOLD OUT!*\n[{event_name}]\n{member} ({new_session['label']})\n"
-                    f"Habis dari {prev_available} tersedia!"
-                )
+                    f"🔴 *SOLD OUT!*\n[{event_name}]\n{member} ({sess})\n"
+                    f"Habis dari {prev_available} tersedia!")
+
+            # 2. Stok balik: habis -> tersedia lagi
+            elif prev_available == 0 and new_available > 0:
+                changes.append({
+                    'type': 'stock_return', 'event': event_name, 'member': member,
+                    'session': sess, 'session_date': adjusted_date,
+                    'returned_quota': new_available, 'timestamp': now_wib().isoformat(),
+                })
+                send_telegram_notification(
+                    f"♻️ *STOK BALIK!*\n[{event_name}]\n{member} ({sess})\n"
+                    f"Sold Out → {new_available} tersedia")
+
+            # 3. Stok berkurang (kemungkinan pembelian)
+            elif new_available < prev_available:
+                diff = prev_available - new_available
+                changes.append({
+                    'type': 'stock_decrease', 'event': event_name, 'member': member,
+                    'session': sess, 'session_date': adjusted_date,
+                    'old_quota': prev_available, 'new_quota': new_available,
+                    'difference': diff, 'remaining': new_available,
+                    'timestamp': now_wib().isoformat(),
+                })
+                if diff >= NOTIFY_DECREASE_MIN:
+                    send_telegram_notification(
+                        f"📉 *STOK BERKURANG!*\n[{event_name}]\n{member} ({sess})\n"
+                        f"{prev_available} → {new_available} (-{diff})")
+
+            # 4. Stok bertambah
+            elif new_available > prev_available:
+                diff = new_available - prev_available
+                changes.append({
+                    'type': 'stock_increase', 'event': event_name, 'member': member,
+                    'session': sess, 'session_date': adjusted_date,
+                    'old_quota': prev_available, 'new_quota': new_available,
+                    'difference': diff, 'timestamp': now_wib().isoformat(),
+                })
+                send_telegram_notification(
+                    f"📈 *STOK BERTAMBAH!*\n[{event_name}]\n{member} ({sess})\n"
+                    f"{prev_available} → {new_available} (+{diff})")
 
     return changes
 

@@ -311,14 +311,15 @@ def send_telegram_notification(message):
         return False
 
 def detect_changes(new_data):
-    """Deteksi perubahan stok (AVAILABLE-ONLY): sold_out & stock_return.
-    API /bonus tidak punya tickets_sold, jadi transaksi/refund tidak dilacak."""
+    """Deteksi perubahan stok dari available_quota:
+    sold_out, stock_return (balik), stock_decrease (berkurang), stock_increase (bertambah)."""
     if not st.session_state.previous_data:
         st.session_state.previous_data = new_data
         return []
 
     changes = []
     prev_data = st.session_state.previous_data
+    notify = st.session_state.notifications_enabled
 
     for new_session in new_data.get('session', []):
         prev_session = next(
@@ -341,28 +342,44 @@ def detect_changes(new_data):
             new_available = new_detail.get('available_quota', 0)
             prev_available = prev_detail.get('available_quota', 0)
             member = new_detail['jkt48_member_name']
+            sess = new_session['label']
+            sdate = new_session.get('date', '')
 
-            # Stok kembali: habis -> tersedia lagi
-            if prev_available == 0 and new_available > 0:
-                changes.append({
-                    'type': 'stock_return', 'member': member, 'session': new_session['label'],
-                    'session_date': new_session.get('date', ''), 'returned_quota': new_available,
-                    'timestamp': datetime.now(),
-                })
-                if st.session_state.notifications_enabled:
-                    send_telegram_notification(
-                        f"♻️ *STOCK KEMBALI!*\n{member} ({new_session['label']})\nSold Out → {new_available} tersedia")
+            # 1. Sold out
+            if prev_available > 0 and new_available == 0:
+                changes.append({'type': 'sold_out', 'member': member, 'session': sess,
+                                'session_date': sdate, 'last_available': prev_available,
+                                'timestamp': datetime.now()})
+                if notify:
+                    send_telegram_notification(f"🔴 *SOLD OUT!*\n{member} ({sess})\nHabis dari {prev_available} tersedia!")
 
-            # Sold out: tersedia -> habis
-            elif prev_available > 0 and new_available == 0:
-                changes.append({
-                    'type': 'sold_out', 'member': member, 'session': new_session['label'],
-                    'session_date': new_session.get('date', ''), 'last_available': prev_available,
-                    'timestamp': datetime.now(),
-                })
-                if st.session_state.notifications_enabled:
-                    send_telegram_notification(
-                        f"🔴 *SOLD OUT!*\n{member} ({new_session['label']})\nHabis dari {prev_available} tersedia!")
+            # 2. Stok balik
+            elif prev_available == 0 and new_available > 0:
+                changes.append({'type': 'stock_return', 'member': member, 'session': sess,
+                                'session_date': sdate, 'returned_quota': new_available,
+                                'timestamp': datetime.now()})
+                if notify:
+                    send_telegram_notification(f"♻️ *STOK BALIK!*\n{member} ({sess})\nSold Out → {new_available} tersedia")
+
+            # 3. Stok berkurang
+            elif new_available < prev_available:
+                diff = prev_available - new_available
+                changes.append({'type': 'stock_decrease', 'member': member, 'session': sess,
+                                'session_date': sdate, 'old_quota': prev_available,
+                                'new_quota': new_available, 'difference': diff,
+                                'remaining': new_available, 'timestamp': datetime.now()})
+                if notify:
+                    send_telegram_notification(f"📉 *STOK BERKURANG!*\n{member} ({sess})\n{prev_available} → {new_available} (-{diff})")
+
+            # 4. Stok bertambah
+            elif new_available > prev_available:
+                diff = new_available - prev_available
+                changes.append({'type': 'stock_increase', 'member': member, 'session': sess,
+                                'session_date': sdate, 'old_quota': prev_available,
+                                'new_quota': new_available, 'difference': diff,
+                                'timestamp': datetime.now()})
+                if notify:
+                    send_telegram_notification(f"📈 *STOK BERTAMBAH!*\n{member} ({sess})\n{prev_available} → {new_available} (+{diff})")
 
     if changes:
         st.session_state.change_log.extend(changes)
@@ -690,16 +707,17 @@ else:
         
         # Show alerts for recent changes
         if changes:
-            for change in changes[-3:]:  # Show last 3 changes
-                if change['type'] == 'stock_increase':
-                    st.success(
-                        f"📈 **STOCK NAIK!** {change['member']} ({change['session']}): "
-                        f"{change['old_quota']} → {change['new_quota']} (+{change['difference']})"
-                    )
-                else:
-                    st.error(
-                        f"🔴 **SOLD OUT!** {change['member']} ({change['session']})"
-                    )
+            for change in changes[-5:]:  # Show last 5 changes
+                t = change['type']
+                m, s = change.get('member', '?'), change.get('session', '?')
+                if t == 'stock_increase':
+                    st.success(f"📈 **STOK BERTAMBAH!** {m} ({s}): {change['old_quota']} → {change['new_quota']} (+{change['difference']})")
+                elif t == 'stock_decrease':
+                    st.warning(f"📉 **STOK BERKURANG!** {m} ({s}): {change['old_quota']} → {change['new_quota']} (-{change['difference']})")
+                elif t == 'stock_return':
+                    st.info(f"♻️ **STOK BALIK!** {m} ({s}): Sold Out → {change.get('returned_quota', 0)}")
+                else:  # sold_out
+                    st.error(f"🔴 **SOLD OUT!** {m} ({s})")
         
         # Create DataFrame
         df = create_dataframe(data)
@@ -990,17 +1008,22 @@ else:
             col1, col2, col3 = st.columns([2, 2, 1])
             
             with col1:
+                _type_labels = {
+                    'sold_out': '🔴 Sold Out',
+                    'stock_decrease': '📉 Stok Berkurang',
+                    'stock_increase': '📈 Stok Bertambah',
+                    'stock_return': '♻️ Stok Balik',
+                    # tipe lama (histori) tetap bisa difilter
+                    'refund': '💳 Refund',
+                    'new_transaction': '🎫 Transaksi',
+                }
+                _type_opts = ['sold_out', 'stock_decrease', 'stock_increase', 'stock_return',
+                              'new_transaction', 'refund']
                 change_filter = st.multiselect(
                     "Filter by Type",
-                    options=['stock_return', 'refund', 'stock_increase', 'new_transaction', 'sold_out'],
-                    default=['stock_return', 'refund', 'stock_increase', 'new_transaction', 'sold_out'],
-                    format_func=lambda x: {
-                        'stock_return': '♻️ Stock Kembali',
-                        'refund': '💳 Refund',
-                        'stock_increase': '📈 Stock Naik',
-                        'new_transaction': '🎫 Transaksi',
-                        'sold_out': '🔴 Sold Out'
-                    }.get(x, x)
+                    options=_type_opts,
+                    default=_type_opts,
+                    format_func=lambda x: _type_labels.get(x, x)
                 )
             
             with col2:
@@ -1144,10 +1167,23 @@ else:
                             📅 <strong>Event: {date_display}</strong><br>
                             <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
                             🎭 Sesi: {session_info}<br>
-                            Stock: {change.get('old_quota', 0)} → {change.get('new_quota', 0)} (+{change.get('difference', 0)})
+                            Stok bertambah: {change.get('old_quota', 0)} → {change.get('new_quota', 0)} (+{change.get('difference', 0)})
                         </div>
                         """)
-                    
+
+                    # Stok Berkurang (kemungkinan pembelian)
+                    elif change['type'] == 'stock_decrease':
+                        blocks.append(f"""
+                        <div style="background: #26a69a; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; font-weight: bold; margin-bottom: 0.5rem;">
+                            📉 <strong>Transaksi: {timestamp}</strong><br>
+                            📅 <strong>Event: {date_display}</strong><br>
+                            <strong>[{event_name}] {change.get('member', 'N/A')}</strong><br>
+                            🎭 Sesi: {session_info}<br>
+                            Stok berkurang: {change.get('old_quota', 0)} → {change.get('new_quota', 0)} (-{change.get('difference', 0)})<br>
+                            Sisa: {change.get('remaining', change.get('new_quota', 0))}
+                        </div>
+                        """)
+
                     # New Transaction
                     elif change['type'] == 'new_transaction':
                         blocks.append(f"""
