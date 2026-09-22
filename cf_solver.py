@@ -19,6 +19,7 @@ Fail-safe: kalau CAPSOLVER_API_KEY kosong / solve gagal -> return None,
 worker tetap jalan (hanya tetap kena 403 seperti tanpa solver).
 """
 import os
+import json
 import time
 import threading
 from urllib.parse import urlsplit
@@ -32,12 +33,38 @@ _RESULT_URL = "https://api.capsolver.com/getTaskResult"
 # URL 'seed' di belakang Cloudflare untuk di-solve (endpoint list JKT48)
 _SEED_URL = "https://jkt48.com/api/v1/exclusives?lang=id"
 
-_TTL_SECONDS = 12 * 60      # refresh sebelum sticky 15 mnt / cf_clearance 30 mnt habis
+_TTL_SECONDS = 25 * 60          # umur cache clearance (naik dari 12m -> hemat solve;
+                                # rotasi IP sticky di ~15m tetap memicu re-solve via 403)
+_MIN_RESOLVE_SECONDS = 90       # cooldown: jangan solve ulang kalau baru solve < ini (anti solve-storm saat IP rotasi)
 _POLL_TRIES = 40
 _POLL_DELAY = 3
 
+# Cache bersama antar-proses (worker & dashboard pakai proxy sticky yang SAMA):
+# worker solve -> tulis file; dashboard baca file -> tak perlu solve sendiri.
+CF_CLEARANCE_FILE = "/mnt/user-data/outputs/cf_clearance.json"
+
 _lock = threading.Lock()
-_cache = {}   # proxy_url -> {"cf_clearance", "user_agent", "ts"}
+_cache = {}          # proxy_url -> {"cf_clearance", "user_agent", "ts"}
+_last_solve_ts = 0.0 # waktu solve terakhir (untuk cooldown)
+
+
+def _read_shared():
+    try:
+        if os.path.exists(CF_CLEARANCE_FILE):
+            with open(CF_CLEARANCE_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def _write_shared(proxy_url, sol):
+    try:
+        os.makedirs(os.path.dirname(CF_CLEARANCE_FILE), exist_ok=True)
+        with open(CF_CLEARANCE_FILE, "w") as f:
+            json.dump({"proxy_url": proxy_url, **sol}, f)
+    except Exception:
+        pass
 
 
 def enabled() -> bool:
@@ -114,18 +141,45 @@ def _solve(proxy_url: str):
 
 def get_clearance(proxy_url: str, force: bool = False):
     """
-    Return (cf_clearance, user_agent) untuk proxy. Solve/refresh bila perlu.
+    Return (cf_clearance, user_agent) untuk proxy. Hemat solve:
+      1) cache in-memory (fresh, non-force) -> pakai
+      2) cache file bersama (proses lain baru solve) -> pakai, hindari solve
+      3) cooldown: walau force, jangan solve kalau baru solve < _MIN_RESOLVE_SECONDS
+      4) baru solve ke CapSolver
     (None, None) kalau CapSolver tidak aktif / tidak ada proxy / gagal.
     """
+    global _last_solve_ts
     if not CAPSOLVER_API_KEY or not proxy_url:
         return None, None
     with _lock:
+        now = time.time()
+
+        # 1) in-memory fresh
         c = _cache.get(proxy_url)
-        if c and not force and (time.time() - c["ts"] < _TTL_SECONDS):
+        if c and not force and (now - c["ts"] < _TTL_SECONDS):
             return c["cf_clearance"], c["user_agent"]
+
+        # 2) cache file bersama (mis. worker sudah solve; dashboard tinggal pakai)
+        shared = _read_shared()
+        if shared and shared.get("proxy_url") == proxy_url and shared.get("cf_clearance"):
+            age = now - shared.get("ts", 0)
+            # non-force: pakai kalau masih dalam TTL.
+            # force: pakai hanya kalau SANGAT baru (< cooldown) -> berarti proses lain
+            #        baru saja solve untuk rotasi IP yang sama; tak perlu solve lagi.
+            if age < _TTL_SECONDS and (not force or age < _MIN_RESOLVE_SECONDS):
+                _cache[proxy_url] = shared
+                return shared["cf_clearance"], shared["user_agent"]
+
+        # 3) cooldown anti solve-storm (mis. banyak event 403 di iterasi yang sama)
+        if force and c and (now - _last_solve_ts) < _MIN_RESOLVE_SECONDS:
+            return c["cf_clearance"], c["user_agent"]
+
+        # 4) solve
         sol = _solve(proxy_url)
         if sol:
+            _last_solve_ts = time.time()
             _cache[proxy_url] = sol
+            _write_shared(proxy_url, sol)
             return sol["cf_clearance"], sol["user_agent"]
         return None, None
 
