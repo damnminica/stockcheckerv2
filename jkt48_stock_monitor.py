@@ -623,28 +623,11 @@ with st.sidebar:
     st.subheader("🔔 Notifications")
     
     with st.expander("📱 Telegram Bot", expanded=False):
-        st.info(f"""
-        **Status:** ✅ Configured
-        
-        Notifications will be sent to:
-        - Bot Token: `...{TELEGRAM_BOT_TOKEN[-10:]}`
-        - Chat ID: `{TELEGRAM_CHAT_ID}`
-        """)
-        
-        # Test notification button
-        if st.button("🧪 Test Notification", use_container_width=True, key="test_telegram"):
-            test_msg = f"🧪 *Test Notification*\n\nJKT48 Monitor aktif!\n\nTime: {now_wib().strftime('%H:%M:%S WIB')}"
-            if send_telegram_notification(test_msg):
-                st.success("✅ Test notification sent!")
-            else:
-                st.error("❌ Failed to send test notification")
-        
-        # Enable/disable toggle
-        st.session_state.notifications_enabled = st.checkbox(
-            "Enable Notifications",
-            value=st.session_state.get('notifications_enabled', False),
-            help="Receive Telegram alerts for stock changes"
-        )
+        st.info("Notifikasi stok dikirim otomatis oleh background worker 24/7 "
+                "(sold out / berkurang / bertambah / stok balik).")
+        # Dashboard tidak mengirim notif sendiri (worker yang menangani), supaya
+        # pengunjung publik tidak bisa memicu kiriman Telegram.
+        st.session_state.notifications_enabled = False
     
     st.divider()
     # Monitor settings
@@ -653,17 +636,11 @@ with st.sidebar:
     
     if auto_refresh:
         refresh_interval = st.slider("Interval (seconds)", 10, 300, 30)
-        st.session_state.notifications_enabled = st.checkbox(
-            "Enable Notifications",
-            value=st.session_state.notifications_enabled
-        )
         # NB: st_autorefresh dipanggil di branch Detail (bukan di sini) supaya
         # tidak dobel dengan summary_autorefresh saat mode Summary aktif.
         st.info(f"🔄 Refreshing every {refresh_interval}s")
-        if st.session_state.notifications_enabled:
-            st.success("🔔 Notifications ON")
-    else:
-        st.session_state.notifications_enabled = False
+    # Notifikasi selalu ditangani worker; dashboard tidak mengirim (aman untuk publik)
+    st.session_state.notifications_enabled = False
 
 # Main content
 st.title("🎵 JKT48 Stock Monitor")
