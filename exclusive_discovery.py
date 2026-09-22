@@ -49,20 +49,23 @@ def now_wib() -> datetime:
 # ── Telegram (requests OK — Telegram tidak kena CF) ──────────────────────────
 
 def _send_telegram(message: str) -> bool:
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        wib_time = now_wib().strftime('%d/%m/%Y %H:%M:%S WIB')
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": f"💎 *JKT48 Exclusive Baru!*\n\n{message}\n\n⏰ {wib_time}",
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
-        }
-        resp = requests.post(url, json=payload, timeout=10)
-        return resp.json().get("ok", False)
-    except Exception as e:
-        print(f"  [Discovery] Telegram error: {e}")
+    chat_ids = [c.strip() for c in str(TELEGRAM_CHAT_ID).split(',') if c.strip()]
+    if not TELEGRAM_BOT_TOKEN or not chat_ids:
         return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    wib_time = now_wib().strftime('%d/%m/%Y %H:%M:%S WIB')
+    text = f"💎 *JKT48 Exclusive Baru!*\n\n{message}\n\n⏰ {wib_time}"
+    ok_any = False
+    for cid in chat_ids:
+        try:
+            resp = requests.post(url, json={
+                "chat_id": cid, "text": text,
+                "parse_mode": "Markdown", "disable_web_page_preview": True,
+            }, timeout=10)
+            ok_any = ok_any or resp.json().get("ok", False)
+        except Exception as e:
+            print(f"  [Discovery] Telegram error ({cid}): {e}")
+    return ok_any
 
 
 # ── Fetch list exclusives — async pakai session persistent ────────────────────

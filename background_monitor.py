@@ -230,20 +230,23 @@ def save_change_log(changes):
         print(f"Error saving change log: {e}")
 
 def send_telegram_notification(message):
-    """Send notification via Telegram with hardcoded credentials and WIB timezone"""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        wib_time = now_wib().strftime('%d/%m/%Y %H:%M:%S WIB')
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": f"🎵 *JKT48 Stock Alert*\n\n{message}\n\n⏰ {wib_time}",
-            "parse_mode": "Markdown"
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json().get('ok', False)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+    """Kirim notif ke SEMUA chat ID di TELEGRAM_CHAT_ID (dipisah koma)."""
+    chat_ids = [c.strip() for c in str(TELEGRAM_CHAT_ID).split(',') if c.strip()]
+    if not TELEGRAM_BOT_TOKEN or not chat_ids:
         return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    wib_time = now_wib().strftime('%d/%m/%Y %H:%M:%S WIB')
+    text = f"🎵 *JKT48 Stock Alert*\n\n{message}\n\n⏰ {wib_time}"
+    ok_any = False
+    for cid in chat_ids:
+        try:
+            resp = requests.post(url, json={
+                "chat_id": cid, "text": text, "parse_mode": "Markdown"
+            }, timeout=10)
+            ok_any = ok_any or resp.json().get('ok', False)
+        except Exception as e:
+            print(f"Telegram error ({cid}): {e}")
+    return ok_any
 
 
 def build_and_save_summary_cache(all_event_data, known_raw):

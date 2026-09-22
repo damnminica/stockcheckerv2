@@ -296,19 +296,21 @@ def fetch_api_data():
         return None
 
 def send_telegram_notification(message):
-    """Send notification via Telegram with hardcoded credentials"""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown"
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json().get('ok', False)
-    except Exception as e:
-        st.error(f"Telegram error: {str(e)}")
+    """Kirim notif ke SEMUA chat ID di TELEGRAM_CHAT_ID (dipisah koma)."""
+    chat_ids = [c.strip() for c in str(TELEGRAM_CHAT_ID).split(',') if c.strip()]
+    if not TELEGRAM_BOT_TOKEN or not chat_ids:
         return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    ok_any = False
+    for cid in chat_ids:
+        try:
+            resp = requests.post(url, json={
+                "chat_id": cid, "text": message, "parse_mode": "Markdown"
+            }, timeout=10)
+            ok_any = ok_any or resp.json().get('ok', False)
+        except Exception as e:
+            st.error(f"Telegram error ({cid}): {str(e)}")
+    return ok_any
 
 def detect_changes(new_data):
     """Deteksi perubahan stok dari available_quota:
