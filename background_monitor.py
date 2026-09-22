@@ -526,19 +526,16 @@ def detect_changes(new_data, prev_data, event_name, config):
 
     return changes
 
-async def monitor_loop():
-    """Main monitoring loop — async dengan aiohttp session persistent."""
+async def monitor_loop(session):
+    """Main monitoring loop — pakai curl_cffi session yang dibuat di main()."""
     print("=" * 60)
     print("🚀 JKT48 Background Monitor Started")
     print(f"🔄 Refresh interval: {REFRESH_INTERVAL}s")
     print(f"🔍 Discovery interval: every {DISCOVERY_INTERVAL} iterations")
     print(f"📁 Change log: {CHANGE_LOG_FILE}")
     print(f"💾 Config file: {CONFIG_FILE}")
-    print(f"🌐 Transport: aiohttp persistent session (CF-resistant)")
+    print(f"🌐 Transport: curl_cffi (impersonate chrome, CF-resistant)")
     print("=" * 60)
-
-    # Satu session untuk seluruh lifetime proses
-    session = await create_session()
 
     iteration = 0
     consecutive_errors = 0
@@ -726,9 +723,121 @@ async def monitor_loop():
                 await asyncio.sleep(REFRESH_INTERVAL)
 
     finally:
-        await session.close()
-        print("\n👋 Background monitor stopped. Session closed.")
+        print("\n👋 Background monitor loop stopped.")
+
+
+# ── Command bot (bot TERPISAH via CMD_BOT_TOKEN) ────────────────────────────
+CMD_BOT_TOKEN = os.environ.get("CMD_BOT_TOKEN", "")
+
+
+def _cmd_authorized(chat_id) -> bool:
+    """Hanya penerima notif (TELEGRAM_CHAT_ID) yang boleh pakai command."""
+    allow = {c.strip() for c in str(TELEGRAM_CHAT_ID).split(',') if c.strip()}
+    return str(chat_id) in allow
+
+
+def _cmd_send(chat_id, text):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{CMD_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"  [CmdBot] send error: {e}")
+
+
+async def _build_status_report(session) -> str:
+    lines = ["🩺 *Status StockChecker48*"]
+    # 1) Kesegaran summary cache (ditulis worker tiap iterasi)
+    try:
+        if os.path.exists(SUMMARY_CACHE_FILE):
+            with open(SUMMARY_CACHE_FILE) as f:
+                cache = json.load(f)
+            age = int(time.time() - os.path.getmtime(SUMMARY_CACHE_FILE))
+            lines.append(f"🗂️ Cache: {cache.get('total_events', 0)} event · "
+                         f"{len(cache.get('rows', []))} baris")
+            lines.append(f"⏱️ Update worker terakhir: {age}s lalu "
+                         f"({'🟢 sehat' if age < 180 else '🔴 mungkin macet'})")
+    except Exception:
+        pass
+    # 2) Test fetch LIVE ke API (bukti API benar-benar terjangkau sekarang)
+    await _apply_clearance(session)
+    endpoints = get_all_monitored_endpoints({})
+    tested = None
+    for name, url in endpoints.items():
+        raw = await fetch_api_data_async(session, to_bonus_url(url))
+        if raw is not None:
+            n = len(normalize_bonus(raw).get('session', []))
+            if n > 0:
+                tested = (name, n)
+                break
+    if tested:
+        lines.append(f"✅ *API OK* — fetch `{tested[0][:34]}` = {tested[1]} sesi")
+    else:
+        lines.append("❌ *Test fetch GAGAL* — API tak terjangkau / semua event kosong")
+    lines.append(f"🕐 {now_wib().strftime('%d/%m/%Y %H:%M:%S WIB')}")
+    return "\n".join(lines)
+
+
+async def command_bot_loop(session):
+    """Polling bot TERPISAH (CMD_BOT_TOKEN) untuk command /cek & /status.
+    Tidak menyentuh @Track48bot / webhook goldenherd. No-op kalau token kosong."""
+    if not CMD_BOT_TOKEN:
+        print("  🤖 Command bot: nonaktif (set CMD_BOT_TOKEN untuk aktifkan)")
+        return
+    print("  🤖 Command bot aktif (polling getUpdates)")
+    base = f"https://api.telegram.org/bot{CMD_BOT_TOKEN}"
+    loop = asyncio.get_event_loop()
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 30}
+            if offset is not None:
+                params["offset"] = offset
+            data = await loop.run_in_executor(
+                None, lambda: requests.get(base + "/getUpdates", params=params, timeout=40).json()
+            )
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat_id = (msg.get("chat") or {}).get("id")
+                text = (msg.get("text") or "").strip()
+                if not chat_id or not text.startswith("/"):
+                    continue
+                cmd = text.split()[0].lstrip("/").split("@")[0].lower()
+                if not _cmd_authorized(chat_id):
+                    _cmd_send(chat_id, "⛔ Kamu tidak berwenang memakai bot ini.")
+                    continue
+                if cmd in ("start", "help"):
+                    _cmd_send(chat_id, "🤖 *StockChecker48 Status Bot*\n\n"
+                                       "/cek — test fetch API + cek worker\n"
+                                       "/status — sama dengan /cek")
+                elif cmd in ("cek", "status", "test"):
+                    _cmd_send(chat_id, "⏳ Mengecek API & worker…")
+                    try:
+                        _cmd_send(chat_id, await _build_status_report(session))
+                    except Exception as e:
+                        _cmd_send(chat_id, f"❌ Error saat cek: {e}")
+                else:
+                    _cmd_send(chat_id, "Perintah tak dikenal. Coba /cek")
+        except Exception as e:
+            print(f"  [CmdBot] loop error: {e}")
+            await asyncio.sleep(5)
+
+
+async def main():
+    session = await create_session()
+    try:
+        await asyncio.gather(monitor_loop(session), command_bot_loop(session))
+    finally:
+        try:
+            await session.close()
+        except Exception:
+            pass
+        print("\n👋 Session closed.")
+
 
 if __name__ == "__main__":
     Path("/mnt/user-data/outputs").mkdir(parents=True, exist_ok=True)
-    asyncio.run(monitor_loop())
+    asyncio.run(main())
