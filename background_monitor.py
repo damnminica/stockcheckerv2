@@ -31,16 +31,32 @@ def _current_proxy_url():
     return px.get("https") if px else None
 
 
+async def _get_exit_ip(session):
+    """Exit IP proxy saat ini (via ipify, bukan CF-protected). None kalau gagal.
+    Dipakai untuk deteksi rotasi IP sticky → cf_clearance harus cocok dgn IP ini."""
+    try:
+        proxies = proxy_pool.requests_proxies()
+        kw = {"proxies": proxies} if proxies else {}
+        r = await session.get("https://api.ipify.org", timeout=15, **kw)
+        if getattr(r, "status_code", None) == 200:
+            return (r.text or "").strip() or None
+    except Exception:
+        pass
+    return None
+
+
 async def _apply_clearance(session, force=False):
-    """Solve/refresh cf_clearance (CapSolver) untuk proxy sticky, set di session
-    (cookie + User-Agent) supaya semua request lolos Cloudflare. No-op kalau CapSolver mati."""
+    """Solve/refresh cf_clearance (CapSolver) untuk exit IP proxy SAAT INI, set di
+    session (cookie + UA). Deteksi rotasi IP sticky: kalau exit IP berubah, solve
+    ulang untuk IP baru (cf_clearance terikat ke IP). No-op kalau CapSolver mati."""
     if not cf_solver.enabled():
         return
     proxy_url = _current_proxy_url()
     if not proxy_url:
         return
+    cur_ip = await _get_exit_ip(session)
     loop = asyncio.get_event_loop()
-    cf, ua = await loop.run_in_executor(None, cf_solver.get_clearance, proxy_url, force)
+    cf, ua = await loop.run_in_executor(None, cf_solver.get_clearance, proxy_url, cur_ip, force)
     if cf:
         try:
             session.cookies.set("cf_clearance", cf, domain=".jkt48.com")

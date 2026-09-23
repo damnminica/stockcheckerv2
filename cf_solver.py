@@ -35,7 +35,7 @@ _SEED_URL = "https://jkt48.com/api/v1/exclusives?lang=id"
 
 _TTL_SECONDS = 25 * 60          # umur cache clearance (naik dari 12m -> hemat solve;
                                 # rotasi IP sticky di ~15m tetap memicu re-solve via 403)
-_MIN_RESOLVE_SECONDS = 90       # cooldown: jangan solve ulang kalau baru solve < ini (anti solve-storm saat IP rotasi)
+_MIN_RESOLVE_SECONDS = 20       # cooldown ringan: cegah solve-storm dlm 1 iterasi, tapi tetap cepat adaptif saat IP rotasi
 _POLL_TRIES = 40
 _POLL_DELAY = 3
 
@@ -139,44 +139,47 @@ def _solve(proxy_url: str):
         return None
 
 
-def get_clearance(proxy_url: str, force: bool = False):
+def get_clearance(proxy_url: str, current_ip: str = None, force: bool = False):
     """
-    Return (cf_clearance, user_agent) untuk proxy. Hemat solve:
-      1) cache in-memory (fresh, non-force) -> pakai
-      2) cache file bersama (proses lain baru solve) -> pakai, hindari solve
-      3) cooldown: walau force, jangan solve kalau baru solve < _MIN_RESOLVE_SECONDS
-      4) baru solve ke CapSolver
-    (None, None) kalau CapSolver tidak aktif / tidak ada proxy / gagal.
+    Return (cf_clearance, user_agent) untuk proxy.
+    cf_clearance TERIKAT ke exit IP. Kalau `current_ip` diberikan dan berbeda
+    dari IP saat clearance disolve, WAJIB solve ulang (proxy sticky rotasi IP).
+    Hemat solve: pakai cache in-memory / file bersama kalau IP masih cocok & fresh.
     """
     global _last_solve_ts
     if not CAPSOLVER_API_KEY or not proxy_url:
         return None, None
+
+    def _ip_match(entry):
+        # cocok kalau IP tak diketahui, atau IP entry == IP sekarang
+        return (current_ip is None) or (entry.get("exit_ip") == current_ip)
+
     with _lock:
         now = time.time()
 
-        # 1) in-memory fresh
+        # 1) in-memory: fresh + IP cocok
         c = _cache.get(proxy_url)
-        if c and not force and (now - c["ts"] < _TTL_SECONDS):
+        if c and not force and _ip_match(c) and (now - c["ts"] < _TTL_SECONDS):
             return c["cf_clearance"], c["user_agent"]
 
-        # 2) cache file bersama (mis. worker sudah solve; dashboard tinggal pakai)
+        # 2) cache file bersama (proses lain baru solve utk IP yang sama)
         shared = _read_shared()
-        if shared and shared.get("proxy_url") == proxy_url and shared.get("cf_clearance"):
+        if (shared and shared.get("proxy_url") == proxy_url
+                and shared.get("cf_clearance") and _ip_match(shared)):
             age = now - shared.get("ts", 0)
-            # non-force: pakai kalau masih dalam TTL.
-            # force: pakai hanya kalau SANGAT baru (< cooldown) -> berarti proses lain
-            #        baru saja solve untuk rotasi IP yang sama; tak perlu solve lagi.
             if age < _TTL_SECONDS and (not force or age < _MIN_RESOLVE_SECONDS):
                 _cache[proxy_url] = shared
                 return shared["cf_clearance"], shared["user_agent"]
 
-        # 3) cooldown anti solve-storm (mis. banyak event 403 di iterasi yang sama)
-        if force and c and (now - _last_solve_ts) < _MIN_RESOLVE_SECONDS:
+        # 3) cooldown anti solve-storm — HANYA kalau IP masih cocok (bukan rotasi).
+        #    Kalau IP berubah, lewati cooldown → langsung solve untuk IP baru.
+        if force and c and _ip_match(c) and (now - _last_solve_ts) < _MIN_RESOLVE_SECONDS:
             return c["cf_clearance"], c["user_agent"]
 
-        # 4) solve
+        # 4) solve (ikat ke IP sekarang)
         sol = _solve(proxy_url)
         if sol:
+            sol["exit_ip"] = current_ip
             _last_solve_ts = time.time()
             _cache[proxy_url] = sol
             _write_shared(proxy_url, sol)
