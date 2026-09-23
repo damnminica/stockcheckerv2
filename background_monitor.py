@@ -382,72 +382,94 @@ def _make_session_headers() -> dict:
     }
 
 
+PRIMARY_IMPERSONATE = "safari18_0"   # Safari lebih sering lolos Cloudflare di IP residential drpd Chrome
+SAFARI_TRIES = 5                     # fase 1 (gratis)
+CF_TRIES = 2                         # fase 2 (CapSolver fallback)
+
+
 async def create_session():
     """
-    curl_cffi AsyncSession dengan impersonasi Chrome.
-    Meniru fingerprint TLS/HTTP2 Chrome asli -> lolos Cloudflare, sementara
-    aiohttp/requests polos ketahuan 'bukan browser' dan kena 403 challenge.
+    curl_cffi AsyncSession. Default impersonasi SAFARI (fingerprint Safari lebih
+    sering lolos Cloudflare di IP residential dibanding Chrome). CapSolver dipakai
+    hanya sebagai fallback kalau Safari gagal berkali-kali.
     """
     session = AsyncSession(
-        impersonate="chrome",
+        impersonate=PRIMARY_IMPERSONATE,
         timeout=25,
         headers={"Referer": "https://jkt48.com/", "Origin": "https://jkt48.com"},
     )
-    print("  🌐 curl_cffi AsyncSession (impersonate=chrome)")
+    print(f"  🌐 curl_cffi AsyncSession (impersonate={PRIMARY_IMPERSONATE})")
     if proxy_pool.has_proxies():
-        print(f"  🔌 Proxy pool aktif: {proxy_pool.count()} proxy (rotasi round-robin)")
+        print(f"  🔌 Proxy pool aktif: {proxy_pool.count()} proxy")
     else:
         print("  🔌 Proxy: koneksi langsung (tanpa proxy)")
-    if cf_solver.enabled():
-        print("  🔓 CapSolver aktif — cf_clearance untuk lolos Cloudflare (butuh proxy STICKY)")
-    else:
-        print("  🔓 CapSolver: tidak aktif (set CAPSOLVER_API_KEY untuk aktifkan)")
+    print("  🔓 CapSolver fallback: " + ("aktif" if cf_solver.enabled() else "nonaktif"))
     return session
 
 
-async def fetch_api_data_async(session, api_url, extra_cookies=None, max_retries=3):
+def _extract_data(resp):
+    """Ambil data['data'] dari respons kalau valid (200 JSON), else None."""
+    try:
+        ct = resp.headers.get("Content-Type", "")
+        if resp.status_code == 200 and "text/html" not in ct:
+            data = resp.json()
+            if data.get("status") and data.get("data") is not None:
+                return data["data"]
+    except Exception:
+        pass
+    return None
+
+
+async def fetch_api_data_async(session, api_url, extra_cookies=None, max_retries=SAFARI_TRIES):
     """
-    Fetch satu endpoint JKT48 API pakai curl_cffi (impersonasi Chrome).
-    Rotasi proxy per attempt kalau JKT48_PROXY_LIST di-set (kalau tidak: langsung).
+    Fetch JKT48 API dua-fase:
+      Fase 1 — impersonasi Safari (GRATIS), beberapa retry. Sering lolos Cloudflare.
+      Fase 2 — fallback CapSolver: cf_clearance + impersonasi Chrome (kalau aktif).
     """
+    proxies = proxy_pool.requests_proxies()
+    base_kw = {}
+    if proxies:
+        base_kw["proxies"] = proxies
+    if extra_cookies:
+        base_kw["cookies"] = dict(extra_cookies)
+
+    last_status = None
+    # ── Fase 1: Safari (gratis) ──
     for attempt in range(1, max_retries + 1):
         try:
-            kw = {}
-            proxies = proxy_pool.requests_proxies()  # rotasi; None kalau tak ada proxy
-            if proxies:
-                kw["proxies"] = proxies
-            if extra_cookies:
-                kw["cookies"] = extra_cookies
-
-            resp = await session.get(api_url, **kw)
-            content_type = resp.headers.get("Content-Type", "")
-
-            if resp.status_code == 200 and "text/html" not in content_type:
-                data = resp.json()
-                # /bonus: data["data"] array (bisa [] utk event selesai).
-                if data.get("status") and data.get("data") is not None:
-                    return data["data"]
-                print(f"     ⚠️  Status OK tapi struktur data tidak valid")
-                return None
-
-            elif "text/html" in content_type or resp.status_code in (403, 429, 503):
-                print(f"     ⚠️  Cloudflare challenge (status={resp.status_code}, "
-                      f"attempt {attempt}/{max_retries})")
-                # Paksa solve ulang cf_clearance (IP sticky mungkin rotasi / cookie kadaluarsa)
-                await _apply_clearance(session, force=True)
-                await asyncio.sleep(5 * attempt)
-                continue
-
-            else:
-                print(f"     ⚠️  HTTP {resp.status_code} untuk {api_url}")
-                await asyncio.sleep(3 * attempt)
-                continue
-
+            resp = await session.get(api_url, impersonate=PRIMARY_IMPERSONATE, **base_kw)
+            data = _extract_data(resp)
+            if data is not None:
+                return data
+            last_status = resp.status_code
         except Exception as e:
-            print(f"     ❌ Error attempt {attempt}/{max_retries}: {e}")
-            await asyncio.sleep(5 * attempt)
+            print(f"     ❌ safari {attempt}/{max_retries}: {str(e)[:50]}")
+        await asyncio.sleep(2 + attempt)
 
-    print(f"     ❌ Semua {max_retries} attempt gagal untuk {api_url}")
+    # ── Fase 2: CapSolver fallback (chrome + cf_clearance) ──
+    if cf_solver.enabled() and proxies:
+        cur_ip = await _get_exit_ip(session)
+        loop = asyncio.get_event_loop()
+        cf, ua = await loop.run_in_executor(
+            None, cf_solver.get_clearance, proxies.get("https"), cur_ip, False
+        )
+        if cf:
+            kw = dict(base_kw)
+            kw["cookies"] = {**(base_kw.get("cookies") or {}), "cf_clearance": cf}
+            if ua:
+                kw["headers"] = {"User-Agent": ua}
+            for attempt in range(1, CF_TRIES + 1):
+                try:
+                    resp = await session.get(api_url, impersonate="chrome", **kw)
+                    data = _extract_data(resp)
+                    if data is not None:
+                        return data
+                    last_status = resp.status_code
+                except Exception as e:
+                    print(f"     ❌ capsolver {attempt}/{CF_TRIES}: {str(e)[:50]}")
+                await asyncio.sleep(3)
+
+    print(f"     ⚠️  Fetch gagal (status={last_status}) — Cloudflare/proxy")
     return None
 
 def detect_changes(new_data, prev_data, event_name, config):
@@ -583,8 +605,8 @@ async def monitor_loop(session):
                 if cf_cookies:
                     print(f"  🍪 Manual CF cookie loaded (fallback)")
 
-                # Cloudflare clearance via CapSolver (dipakai semua request iterasi ini)
-                await _apply_clearance(session)
+                # NB: cf_clearance TIDAK lagi di-set di session (Safari default tak butuh;
+                # CapSolver dipanggil per-request sebagai fallback di fetch_api_data_async).
 
                 # ── Auto-discover exclusive baru ──────────────────────────
                 # Jalan tiap DISCOVERY_INTERVAL, ATAU saat SEMUA event inaktif
@@ -777,8 +799,7 @@ async def _build_status_report(session) -> str:
                          f"({'🟢 sehat' if age < 180 else '🔴 mungkin macet'})")
     except Exception:
         pass
-    # 2) Test fetch LIVE ke API (bukti API benar-benar terjangkau sekarang)
-    await _apply_clearance(session)
+    # 2) Test fetch LIVE ke API (fetch_api_data_async sudah handle Safari + fallback CapSolver)
     endpoints = get_all_monitored_endpoints({})
     tested = None
     for name, url in endpoints.items():

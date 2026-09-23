@@ -268,28 +268,48 @@ def fetch_api_data():
             st.error(f"Event tidak ditemukan: {st.session_state.selected_event}")
             return None
         
-        # Pakai endpoint /bonus (punya angka available_quota) + curl_cffi (lolos Cloudflare)
+        # /bonus + curl_cffi. Fase 1: Safari (gratis). Fase 2: fallback CapSolver (chrome+cf_clearance).
         import cf_solver
         from curl_cffi import requests as cffi_requests
         api_url = to_bonus_url(api_url)
         proxies = proxy_pool.requests_proxies()
-        headers, cookies = {}, {}
+        base = {"timeout": 20}
+        if proxies:
+            base["proxies"] = proxies
+
+        def _ok(r):
+            if r.status_code == 200 and 'text/html' not in r.headers.get('content-type', ''):
+                d = r.json()
+                if d.get('status') and d.get('data') is not None:
+                    return normalize_bonus(d['data'])
+            return None
+
+        # Fase 1: Safari
+        for _ in range(4):
+            try:
+                r = cffi_requests.get(api_url, impersonate="safari18_0", **base)
+                out = _ok(r)
+                if out is not None:
+                    return out
+            except Exception:
+                pass
+
+        # Fase 2: CapSolver fallback
         if cf_solver.enabled() and proxies:
             cf, ua = cf_solver.get_clearance(proxies.get("https"))
             if cf:
-                cookies["cf_clearance"] = cf
-            if ua:
-                headers["User-Agent"] = ua
-        response = cffi_requests.get(
-            api_url, impersonate="chrome", timeout=20,
-            proxies=proxies, headers=headers or None, cookies=cookies or None
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get('status') and data.get('data') is not None:
-            # /bonus: array sesi -> bentuk internal seragam (available_quota, tanpa tickets_sold)
-            return normalize_bonus(data['data'])
+                try:
+                    r = cffi_requests.get(
+                        api_url, impersonate="chrome",
+                        cookies={"cf_clearance": cf},
+                        headers={"User-Agent": ua} if ua else None, **base
+                    )
+                    out = _ok(r)
+                    if out is not None:
+                        return out
+                except Exception:
+                    pass
+        st.error("Gagal fetch (Cloudflare/proxy). Coba refresh.")
         return None
     except Exception as e:
         st.error(f"Error fetching API: {str(e)}")
