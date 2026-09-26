@@ -494,9 +494,16 @@ def detect_changes(new_data, prev_data, event_name, config):
     changes = []
 
     for new_session in new_data.get('session', []):
+        # Cocokkan sesi via kode unik (label bisa DUPLIKAT antar-tanggal!).
+        # Fallback: label + date. TIDAK boleh label saja.
+        ncode = new_session.get('session_code', '')
         prev_session = next(
+            (s for s in prev_data.get('session', []) if ncode and s.get('session_code') == ncode),
+            None
+        ) or next(
             (s for s in prev_data.get('session', [])
-             if s['label'] == new_session['label']),
+             if s.get('label') == new_session.get('label')
+             and s.get('date') == new_session.get('date')),
             None
         )
         if not prev_session:
@@ -506,9 +513,11 @@ def detect_changes(new_data, prev_data, event_name, config):
         adjusted_date = get_adjusted_event_date(new_session.get('date', ''))
 
         for new_detail in new_session['session_detail']:
+            # Cocokkan member via nama + jalur (label) — satu member bisa >1 jalur.
             prev_detail = next(
                 (d for d in prev_session['session_detail']
-                 if d['jkt48_member_name'] == new_detail['jkt48_member_name']),
+                 if d['jkt48_member_name'] == new_detail['jkt48_member_name']
+                 and d.get('label') == new_detail.get('label')),
                 None
             )
             if not prev_detail:

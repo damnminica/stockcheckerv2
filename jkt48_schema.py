@@ -50,6 +50,8 @@ def normalize_bonus(raw) -> dict:
             "date": s.get("date", ""),
             "start_time": s.get("start_time", ""),
             "end_time": s.get("end_time", ""),
+            # kode sesi unik — WAJIB untuk cocokkan sesi (label bisa DUPLIKAT antar-tanggal!)
+            "session_code": s.get("exclusive_session_code", ""),
             "session_detail": details,
         })
     return {"session": out}
