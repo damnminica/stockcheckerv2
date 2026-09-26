@@ -383,8 +383,9 @@ def _make_session_headers() -> dict:
 
 
 PRIMARY_IMPERSONATE = "safari18_0"   # Safari lebih sering lolos Cloudflare di IP residential drpd Chrome
-SAFARI_TRIES = 5                     # fase 1 (gratis)
-CF_TRIES = 2                         # fase 2 (CapSolver fallback)
+SAFARI_TRIES = 4                     # fase 1 (gratis); backoff pendek biar iterasi cepat
+SAFARI_BACKOFF = 1                   # detik antar-retry Safari (pendek: hindari iterasi molor saat storm)
+CF_TRIES = 1                         # fase 2 (CapSolver fallback) — 1x saja
 
 
 async def create_session():
@@ -420,11 +421,13 @@ def _extract_data(resp):
     return None
 
 
-async def fetch_api_data_async(session, api_url, extra_cookies=None, max_retries=SAFARI_TRIES):
+async def fetch_api_data_async(session, api_url, extra_cookies=None, max_retries=SAFARI_TRIES, quick=False):
     """
     Fetch JKT48 API dua-fase:
       Fase 1 — impersonasi Safari (GRATIS), beberapa retry. Sering lolos Cloudflare.
       Fase 2 — fallback CapSolver: cf_clearance + impersonasi Chrome (kalau aktif).
+    quick=True (mode STORM): 1x percobaan Safari saja, TANPA CapSolver — fail cepat
+      supaya iterasi tidak molor & polling balik ke ~60s saat IP sedang panas.
     """
     proxies = proxy_pool.requests_proxies()
     base_kw = {}
@@ -433,9 +436,10 @@ async def fetch_api_data_async(session, api_url, extra_cookies=None, max_retries
     if extra_cookies:
         base_kw["cookies"] = dict(extra_cookies)
 
+    tries = 1 if quick else max_retries
     last_status = None
     # ── Fase 1: Safari (gratis) ──
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, tries + 1):
         try:
             resp = await session.get(api_url, impersonate=PRIMARY_IMPERSONATE, **base_kw)
             data = _extract_data(resp)
@@ -443,8 +447,12 @@ async def fetch_api_data_async(session, api_url, extra_cookies=None, max_retries
                 return data
             last_status = resp.status_code
         except Exception as e:
-            print(f"     ❌ safari {attempt}/{max_retries}: {str(e)[:50]}")
-        await asyncio.sleep(2 + attempt)
+            print(f"     ❌ safari {attempt}/{tries}: {str(e)[:50]}")
+        if attempt < tries:
+            await asyncio.sleep(SAFARI_BACKOFF)
+
+    if quick:
+        return None   # storm mode: jangan buang waktu ke CapSolver
 
     # ── Fase 2: CapSolver fallback (chrome + cf_clearance) ──
     if cf_solver.enabled() and proxies:
@@ -655,6 +663,7 @@ async def monitor_loop(session):
                 print(f"  🎯 Monitoring {len(monitored_events)} events ({active_count} aktif, {len(inactive_events)} di-skip):")
 
                 event_status = {}
+                storm = False   # kalau IP sedang panas (403-storm), sisa event fetch cepat (quick)
 
                 for event_name in monitored_events:
                     api_url = all_endpoints.get(event_name)
@@ -671,18 +680,22 @@ async def monitor_loop(session):
                     # Pastikan pakai endpoint /bonus (punya angka available_quota)
                     api_url = to_bonus_url(api_url)
 
-                    print(f"\n  📡 [{event_name}]")
+                    print(f"\n  📡 [{event_name}]" + ("  (quick/storm)" if storm else ""))
 
-                    # Fetch pakai curl_cffi (impersonasi Chrome, lolos Cloudflare)
+                    # Fetch. Kalau storm (IP panas): quick=1x tanpa CapSolver -> iterasi cepat,
+                    # polling balik ~60s biar tak melewatkan window saat IP rotasi/dingin.
                     raw = await fetch_api_data_async(
-                        session, api_url, extra_cookies=cf_cookies
+                        session, api_url, extra_cookies=cf_cookies, quick=storm
                     )
 
                     if raw is None:
                         print(f"     ❌ FETCH FAILED")
                         event_status[event_name] = "FETCH FAILED"
                         consecutive_errors += 1
+                        storm = True   # gagal total -> IP panas, sisa event fetch cepat
                         continue
+
+                    storm = False   # ada yang sukses -> IP oke lagi
 
                     # /bonus (array sesi) -> bentuk internal seragam (available_quota, tanpa tickets_sold)
                     new_data = normalize_bonus(raw)
