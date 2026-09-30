@@ -75,9 +75,15 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 # Semua event dikelola otomatis oleh exclusive_discovery.py
 # Tidak ada hardcode — dynamic_endpoints.json dikelola background worker
 
-REFRESH_INTERVAL = 60  # seconds (dinaikkan dari 30s untuk hemat kuota proxy)
+# Polling ADAPTIF (detik, dari awal iterasi ke awal iterasi berikutnya):
+#   REFRESH_INTERVAL — saat sehat (ada fetch yang sukses)
+#   STORM_INTERVAL   — saat 403-storm (semua fetch gagal): mundur biar IP proxy "dingin"
+# Bisa diubah lewat env var Railway tanpa ubah kode.
+REFRESH_INTERVAL = max(10, int(os.environ.get("REFRESH_INTERVAL", "20")))
+STORM_INTERVAL = max(REFRESH_INTERVAL, int(os.environ.get("STORM_INTERVAL", "60")))
 NOTIFY_DECREASE_MIN = 1  # kirim Telegram utk stok berkurang bila selisih >= nilai ini (semua perubahan tetap dicatat)
-DISCOVERY_INTERVAL = 10  # Check for new exclusives every N iterations (~5 menit)
+DISCOVERY_EVERY = int(os.environ.get("DISCOVERY_EVERY", "600"))  # cek exclusive baru tiap N detik
+ALL_INACTIVE_DISCOVERY_EVERY = 120  # saat semua event inaktif: discovery lebih sering, tapi tak tiap iterasi
 CHANGE_LOG_FILE = "/mnt/user-data/outputs/change_log.json"
 PREVIOUS_DATA_FILE = "/mnt/user-data/outputs/previous_data.json"
 CONFIG_FILE = "/mnt/user-data/outputs/monitor_config.json"
@@ -219,29 +225,46 @@ def load_previous_data():
         print(f"Error loading previous data: {e}")
     return {}
 
+def _atomic_json_dump(path, data, **dump_kwargs):
+    """Tulis JSON secara ATOMIK: tulis ke file .tmp lalu os.replace().
+    File tujuan tak pernah setengah-tertulis walau proses dimatikan di tengah
+    (mis. redeploy) — dulu 'open(path, "w")' bisa meninggalkan file rusak."""
+    tmp = f"{path}.tmp"
+    with open(tmp, 'w') as f:
+        json.dump(data, f, **dump_kwargs)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def save_previous_data(data):
     """Save current API data for next comparison"""
     try:
-        with open(PREVIOUS_DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
+        _atomic_json_dump(PREVIOUS_DATA_FILE, data, indent=2)
     except Exception as e:
         print(f"Error saving previous data: {e}")
 
 def load_change_log():
-    """Load change log from file"""
+    """Load change log. Kalau file ada tapi TAK TERBACA (rusak), file disisihkan
+    (bukan ditimpa) supaya riwayat masih bisa dipulihkan manual."""
+    if not os.path.exists(CHANGE_LOG_FILE):
+        return []
     try:
-        if os.path.exists(CHANGE_LOG_FILE):
-            with open(CHANGE_LOG_FILE, 'r') as f:
-                return json.load(f)
+        with open(CHANGE_LOG_FILE, 'r') as f:
+            return json.load(f)
     except Exception as e:
-        print(f"Error loading change log: {e}")
-    return []
+        aside = f"{CHANGE_LOG_FILE}.corrupt-{int(time.time())}"
+        try:
+            os.replace(CHANGE_LOG_FILE, aside)
+            print(f"⚠️  change_log rusak ({e}) — disisihkan ke {aside}, mulai log baru")
+        except Exception as e2:
+            print(f"⚠️  change_log rusak & gagal disisihkan: {e2}")
+        return []
 
 def save_change_log(changes):
-    """Save change log to file — SEMUA perubahan disimpan, tanpa batas."""
+    """Save change log — SEMUA perubahan disimpan, tanpa batas. Tulis atomik."""
     try:
-        with open(CHANGE_LOG_FILE, 'w') as f:
-            json.dump(changes, f, indent=2, default=str)
+        _atomic_json_dump(CHANGE_LOG_FILE, changes, indent=2, default=str)
     except Exception as e:
         print(f"Error saving change log: {e}")
 
@@ -361,8 +384,7 @@ def build_and_save_summary_cache(all_event_data, known_raw):
     }
 
     try:
-        with open(SUMMARY_CACHE_FILE, 'w') as f:
-            json.dump(cache, f, ensure_ascii=False)
+        _atomic_json_dump(SUMMARY_CACHE_FILE, cache, ensure_ascii=False)
         print(f"  💾 Summary cache saved: {len(summary_rows)} rows ({len(all_event_data)} events)")
     except Exception as e:
         print(f"  ❌ Error saving summary cache: {e}")
@@ -585,8 +607,8 @@ async def monitor_loop(session):
     """Main monitoring loop — pakai curl_cffi session yang dibuat di main()."""
     print("=" * 60)
     print("🚀 JKT48 Background Monitor Started")
-    print(f"🔄 Refresh interval: {REFRESH_INTERVAL}s")
-    print(f"🔍 Discovery interval: every {DISCOVERY_INTERVAL} iterations")
+    print(f"🔄 Polling adaptif: {REFRESH_INTERVAL}s (sehat) / {STORM_INTERVAL}s (saat 403-storm)")
+    print(f"🔍 Discovery: tiap {DISCOVERY_EVERY}s")
     print(f"📁 Change log: {CHANGE_LOG_FILE}")
     print(f"💾 Config file: {CONFIG_FILE}")
     print(f"🌐 Transport: curl_cffi (impersonate chrome, CF-resistant)")
@@ -596,17 +618,19 @@ async def monitor_loop(session):
     consecutive_errors = 0
     max_consecutive_errors = 10
     inactive_events = set()   # event dengan /bonus kosong (selesai) — di-skip sampai discovery berikutnya
+    last_discovery = float("-inf")   # monotonic ts discovery terakhir (iterasi pertama langsung discovery)
 
     try:
         while True:
             try:
                 iteration += 1
+                iter_start = time.monotonic()
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 print(f"\n[{timestamp}] ⚡ Iteration #{iteration}")
 
                 # Safety check
                 if consecutive_errors >= max_consecutive_errors:
-                    error_sleep = REFRESH_INTERVAL * 5
+                    error_sleep = STORM_INTERVAL * 2
                     print(f"  ⚠️  {consecutive_errors} consecutive errors — sleeping {error_sleep}s")
                     await asyncio.sleep(error_sleep)
                     consecutive_errors = 0
@@ -615,7 +639,7 @@ async def monitor_loop(session):
                 # Load config dan previous data
                 config       = load_config()
                 previous_data = load_previous_data()
-                change_log   = load_change_log()
+                # change_log baru dimuat saat ada perubahan untuk disimpan (hemat parse JSON besar tiap iterasi)
 
                 # Manual CF cookie (fallback kalau session belum punya cookie)
                 cf_cookies = load_cf_cookie()
@@ -626,11 +650,16 @@ async def monitor_loop(session):
                 # CapSolver dipanggil per-request sebagai fallback di fetch_api_data_async).
 
                 # ── Auto-discover exclusive baru ──────────────────────────
-                # Jalan tiap DISCOVERY_INTERVAL, ATAU saat SEMUA event inaktif
-                # (biar event aktif terbaru cepat ketemu, tak nunggu 10 iterasi).
+                # Berbasis WAKTU (bukan jumlah iterasi, krn interval kini adaptif):
+                # tiap DISCOVERY_EVERY detik, atau lebih sering (ALL_INACTIVE_DISCOVERY_EVERY)
+                # saat SEMUA event inaktif — tapi tak tiap iterasi (hindari burst request).
                 _pre_events = list(get_all_monitored_endpoints({}).keys())
                 all_inactive = bool(_pre_events) and all(e in inactive_events for e in _pre_events)
-                run_discovery = (iteration % DISCOVERY_INTERVAL == 1) or all_inactive
+                since_disc = time.monotonic() - last_discovery
+                run_discovery = (since_disc >= DISCOVERY_EVERY) or (
+                    all_inactive and since_disc >= ALL_INACTIVE_DISCOVERY_EVERY)
+                if run_discovery:
+                    last_discovery = time.monotonic()
 
                 if run_discovery:
                     try:
@@ -656,8 +685,6 @@ async def monitor_loop(session):
                 except Exception as e:
                     print(f"  ⚠️  Could not load known_exclusives: {e}")
 
-                print(f"  📋 Current log has {len(change_log)} entries")
-
                 all_changes      = []
                 all_fetched_data = {}
                 all_endpoints    = get_all_monitored_endpoints({})
@@ -673,6 +700,7 @@ async def monitor_loop(session):
 
                 event_status = {}
                 storm = False   # kalau IP sedang panas (403-storm), sisa event fetch cepat (quick)
+                n_attempt = n_ok = 0   # untuk polling adaptif: iterasi 'storm' = semua fetch gagal
 
                 for event_name in monitored_events:
                     api_url = all_endpoints.get(event_name)
@@ -702,9 +730,12 @@ async def monitor_loop(session):
                         event_status[event_name] = "FETCH FAILED"
                         consecutive_errors += 1
                         storm = True   # gagal total -> IP panas, sisa event fetch cepat
+                        n_attempt += 1
                         continue
 
                     storm = False   # ada yang sukses -> IP oke lagi
+                    n_attempt += 1
+                    n_ok += 1
 
                     # /bonus (array sesi) -> bentuk internal seragam (available_quota, tanpa tickets_sold)
                     new_data = normalize_bonus(raw)
@@ -761,6 +792,7 @@ async def monitor_loop(session):
                 # Save
                 try:
                     if all_changes:
+                        change_log = load_change_log()
                         change_log.extend(all_changes)
                         save_change_log(change_log)
                         print(f"\n  💾 Saved {len(all_changes)} change(s) | Total: {len(change_log)}")
@@ -769,9 +801,15 @@ async def monitor_loop(session):
                     print(f"  ❌ Error saving data: {e}")
                     import traceback; traceback.print_exc()
 
-                print(f"  ✅ Iteration #{iteration} complete")
-                print(f"  😴 Sleeping {REFRESH_INTERVAL}s...")
-                await asyncio.sleep(REFRESH_INTERVAL)
+                # Polling adaptif: siklus dihitung dari AWAL iterasi (bukan kerja + sleep).
+                # Storm (semua fetch gagal) -> mundur ke STORM_INTERVAL biar IP dingin.
+                storm_iter = n_attempt > 0 and n_ok == 0
+                cycle = STORM_INTERVAL if storm_iter else REFRESH_INTERVAL
+                elapsed = time.monotonic() - iter_start
+                sleep_for = max(1.0, cycle - elapsed)
+                print(f"  ✅ Iteration #{iteration} complete ({elapsed:.1f}s, ok {n_ok}/{n_attempt})")
+                print(f"  😴 Next in {sleep_for:.0f}s" + ("  [storm backoff]" if storm_iter else ""))
+                await asyncio.sleep(sleep_for)
 
             except asyncio.CancelledError:
                 break

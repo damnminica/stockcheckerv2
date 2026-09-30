@@ -77,9 +77,13 @@ try:
     # Sort by timestamp (newest first)
     merged.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
     
-    with open('/mnt/user-data/outputs/change_log.json', 'w') as f:
+    # Tulis atomik (tmp + replace) supaya file tak pernah setengah-tertulis
+    import os
+    tmp = '/mnt/user-data/outputs/change_log.json.tmp'
+    with open(tmp, 'w') as f:
         json.dump(merged, f, indent=2)
-    
+    os.replace(tmp, '/mnt/user-data/outputs/change_log.json')
+
     print(f'✅ Merged: {len(existing)} existing + {len(new_entries)} new = {len(merged)} total')
 except Exception as e:
     print(f'⚠️ Merge failed: {e}')
